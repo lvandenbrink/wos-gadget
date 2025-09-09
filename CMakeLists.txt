@@ -19,7 +19,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Set the project name
-set(CMAKE_PROJECT_NAME MJSGadget_dB_meter)
+set(CMAKE_PROJECT_NAME de_Omgevingsmonitor)
 file(GLOB_RECURSE SRC_FILES ${CMAKE_SOURCE_DIR}/Core/Src/*.c)
 
 # Include toolchain file

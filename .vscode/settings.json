@@ -1,5 +1,5 @@
 {
-    "cortex-debug.openocdPath": "C:\\VSARM\\OPENOCD\\BIN\\OPENOCD.EXE",
+    "cortex-debug.openocdPath": "C:\\USERS\\TEUN NOORDKAMP\\APPDATA\\ROAMING\\CODE\\USER\\GLOBALSTORAGE\\BMD.STM32-FOR-VSCODE\\@XPACK-DEV-TOOLS\\OPENOCD\\0.11.0-5.1\\.CONTENT\\BIN\\OPENOCD.EXE",
     "files.associations": {
         "arm_const_structs.h": "c",
         "sound_lut_select.h": "c",
@@ -15,5 +15,6 @@
         "statuscheck.h": "c",
         "main.h": "c"
     },
-    "cortex-debug.variableUseNaturalFormat": false
+    "cortex-debug.variableUseNaturalFormat": false,
+    "cortex-debug.armToolchainPath": "C:\\VSARM\\ARMCC\\10 2021.10\\BIN"
 }
