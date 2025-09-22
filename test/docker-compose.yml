@@ -1,0 +1,18 @@
+services:
+  # mqtt5 eclipse-mosquitto
+  wos-test-mqtt5:
+    image: eclipse-mosquitto
+    ports:
+      - "1883:1883" #default mqtt port
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:rw
+    restart: no
+  wos-test-server:
+    image: python:3.12-slim
+    command: python -u webserver.py
+    working_dir: /app
+    volumes:
+      - .:/app
+    ports:
+      - "9000:9000"
+    restart: no

@@ -1,0 +1,111 @@
+D [00029169] EspState: 4 ATcmd: 0 Mode: 3 ATExp: 0
+D [00029169] ESP_STATE_NEXT_AT -> ESP_STATE_SEND
+D [00029572] EspState: 3 ATcmd: 10 Mode: 3 ATExp: 0
+D [00029573] SET in station/soft-ap mode
+D [00029573] ESP_Send: AT+CWMODE=3
+D [00029574] ESP_STATE_SEND -> ESP_STATE_WAIT_FOR_REPLY
+D [00029976] EspState: 2 ATcmd: 10 Mode: 3 ATExp: 0
+I [00029977] Receive DMA_ProcessBuffer: '\r\nOK\r\n'
+I [00029977] Receive command: 'OK'
+D [00029978] ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_NEXT_AT
+D [00030381] EspState: 4 ATcmd: 10 Mode: 3 ATExp: 0
+D [00030382] ESP_STATE_NEXT_AT -> ESP_STATE_SEND
+D [00030785] EspState: 3 ATcmd: 11 Mode: 3 ATExp: 0
+D [00030786] SET soft AP mode parameters
+D [00030787] ESP_Send: AT+CWSAP="Omgevingsmonitor_Config","",11,0,1
+D [00030788] ESP_STATE_SEND -> ESP_STATE_WAIT_FOR_REPLY
+D [00031190] EspState: 2 ATcmd: 11 Mode: 3 ATExp: 0
+I [00031191] Receive DMA_ProcessBuffer: '\r\nOK\r\n'
+I [00031191] Receive command: 'OK'
+D [00031194] ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_NEXT_AT
+D [00031596] EspState: 4 ATcmd: 11 Mode: 3 ATExp: 0
+D [00031597] ESP_STATE_NEXT_AT -> ESP_STATE_SEND
+D [00031999] EspState: 3 ATcmd: 12 Mode: 3 ATExp: 0
+D [00032000] ESP_Send: AT+CIPMUX=0
+
+D [00032000] ESP_STATE_SEND -> ESP_STATE_WAIT_FOR_REPLY
+I [00032405] The SSID is: 
+I [00032405] The Password is: 
+D [00032407] BoxConfig: 000000000000000000000000
+D [00032410] TempConfig: 000000000000000000000000
+D [00032412] HumidConfig: 000000000000000000000000
+D [00032414] SoundDBaConfig: 000000000000000000000000
+D [00032415] SoundDBAConfig: 000000000000000000000000
+D [00032417] VocConfig: 000000000000000000000000
+D [00032419] BatteryConfig: 000000000000000000000000
+D [00032421] SolarConfig: 000000000000000000000000
+D [00032424] NOxConfig: 000000000000000000000000
+D [00032426] PM2Config: 000000000000000000000000
+D [00032429] PM10Config: 000000000000000000000000
+D [00032430] CustomName: 42616c6b6f6e5f5a56000000
+D [00032431] EspState: 2 ATcmd: 12 Mode: 3 ATExp: 0
+I [00032434] Receive DMA_ProcessBuffer: '\r\nOK\r\n'
+I [00032434] Receive command: 'OK'
+D [00032435] ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_NEXT_AT
+D [00032838] EspState: 4 ATcmd: 12 Mode: 3 ATExp: 0
+D [00032839] ESP_STATE_NEXT_AT -> ESP_STATE_SEND
+D [00033243] EspState: 3 ATcmd: 13 Mode: 3 ATExp: 0
+D [00033244] ESP_Send: AT+WEBSERVER=1,80,60
+D [00033245] ESP_STATE_SEND -> ESP_STATE_WAIT_FOR_REPLY
+D [00033647] EspState: 2 ATcmd: 13 Mode: 3 ATExp: 0
+I [00033648] Receive DMA_ProcessBuffer: '\r\nOK\r\n'
+I [00033648] Receive command: 'OK'
+D [00033649] ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_NEXT_AT
+D [00034052] EspState: 4 ATcmd: 13 Mode: 3 ATExp: 0
+D [00034053] ESP_STATE_NEXT_AT -> ESP_STATE_SEND
+D [00034053] ESP_STATE_NEXT_AT -> ESP_STATE_IDLE
+D [00034456] EspState: 0 ATcmd: 19 Mode: 3 ATExp: 0
+D [00034457] ESP_STATE_IDLE -> ESP_STATE_CONFIG
+D [00034861] EspState: 16 ATcmd: 19 Mode: 3 ATExp: 0
+D [00034862] Do nothing until reset
+D [00035265] Do nothing until reset
+D [00035668] Do nothing until reset
+D [00036070] Do nothing until reset
+D [00036473] Do nothing until reset
+D [00036875] Do nothing until reset
+D [00037277] Do nothing until reset
+D [00037679] Do nothing until reset
+D [00038081] Do nothing until reset
+D [00038483] Do nothing until reset
+D [00038885] Do nothing until reset
+D [00039287] Do nothing until reset
+D [00039689] Do nothing until reset
+D [00040091] Do nothing until reset
+D [00040493] Do nothing until reset
+D [00040895] Do nothing until reset
+D [00041297] Do nothing until reset
+D [00041700] Do nothing until reset
+D [00042104] Do nothing until reset
+D [00042506] Do nothing until reset
+D [00042908] Do nothing until reset
+D [00043310] Do nothing until reset
+D [00043712] Do nothing until reset
+D [00044114] Do nothing until reset
+D [00044516] Do nothing until reset
+D [00044918] Do nothing until reset
+D [00045321] Do nothing until reset
+D [00045723] Do nothing until reset
+D [00046126] Do nothing until reset
+D [00046529] Do nothing until reset
+D [00046932] Do nothing until reset
+D [00047334] Do nothing until reset
+D [00047736] Do nothing until reset
+D [00048138] Do nothing until reset
+D [00048541] Do nothing until reset
+D [00048943] Do nothing until reset
+D [00049346] Do nothing until reset
+D [00049748] Do nothing until reset
+D [00050150] Do nothing until reset
+D [00050552] Do nothing until reset
+D [00050954] Do nothing until reset
+D [00051356] Do nothing until reset
+D [00051758] Do nothing until reset
+D [00052160] Do nothing until reset
+D [00052562] Do nothing until reset
+D [00052964] Do nothing until reset
+D [00053366] Do nothing until reset
+D [00053770] Do nothing until reset
+D [00054173] Do nothing until reset
+D [00054575] Do nothing until reset
+D [00054977] Do nothing until reset
+D [00055379] Do nothing until reset
