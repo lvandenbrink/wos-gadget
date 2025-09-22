@@ -6,6 +6,7 @@
  */
 #include "main.h"
 #include "utils.h"
+#include "usbd_cdc_if.h"
 
 // Default verbose level
 VerboseLevel CurrentVerboseLevel = VERBOSE_ALL;
@@ -66,7 +67,9 @@ void CreateLine(VerboseLevel verboseLevel, char *tag, char *format, ...) {
 }
 
 int _write(int fd, const void *buf, size_t count) {
-  HAL_UART_Transmit(&huart1, buf, count, 100);
+  // HAL_UART_Transmit(&huart1, buf, count, 100);
+  // Write debug info to USB CDC
+  CDC_Transmit_FS((uint8_t*)buf, count);
   return count;
 }
 

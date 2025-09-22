@@ -8,7 +8,7 @@
 
 #include "microphone.h"
 //#include "main.h"
-#include "GPIO.h"
+#include "gpio.h"
 #include "sound_measurement.h"
 #include "print_functions.h"
 

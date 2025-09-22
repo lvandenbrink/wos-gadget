@@ -119,7 +119,7 @@ typedef enum {
   ESP_PROGRAM_RTC,
   ESP_PROGRAM_TEST,
   ESP_PROGRAM_SET_CONN,
-  ESP_PROGRAM_RECONFIG
+  ESP_PROGRAM_CONFIG_AP,
 } ESPProgram;
 
 typedef struct {
@@ -128,6 +128,7 @@ typedef struct {
   bool ready;
   bool startSend;
   bool connectionMade;
+  bool configAP;
   uint8_t errorCounter;
   uint32_t timeOutStamp;
   ESPProgram mode;

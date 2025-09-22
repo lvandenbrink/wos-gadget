@@ -8,9 +8,9 @@
 
 
 #include "ESP.h"
-#include <String.h>
+#include <string.h>
 #include <stdio.h>
-#include "EEprom.h"
+#include <EEProm.h>
 #include "Config.h"
 #include "microphone.h"
 #include "PowerUtils.h"
@@ -48,7 +48,7 @@ SensorType3 *SensLink = NULL;
 WifiConfig Credentials;
 
 static char message[1152];
-static const char API[] = "\"https://api.opensensemap.org/boxes/";
+static const char API[] = "\"http://192.168.1.184:9000/test";
 static AT_Commands ATCommandArray[10];
 static AT_Commands AT_INIT[] = {AT_WAKEUP, AT_SET_RFPOWER, AT_CHECK_RFPOWER, AT_CWINIT, AT_CWAUTOCONN, AT_CWMODE1, AT_CWJAP, AT_CIPMUX};
 static AT_Commands AT_SEND[] = {AT_WAKEUP, AT_HTTPCPOST, AT_SENDDATA}; 
@@ -131,7 +131,6 @@ bool checkName()
 	return test;
 }
 
-
 void DisableESP()
 {
 	EspTurnedOn = false;
@@ -191,6 +190,14 @@ static bool ESP_Receive(uint8_t *reply, uint16_t length)
 		if (status & HAL_UART_ERROR_NE)
 		{
 			Error("Noise error in UART to ESP module");
+			// Try to recover from noise error
+            HAL_UART_AbortReceive(EspUart);
+            HAL_Delay(10);
+            // Reinitialize UART
+            HAL_UART_DeInit(EspUart);
+            HAL_Delay(10);
+            MX_USART4_UART_Init();
+            return false;
 		}
 		if (status & HAL_UART_ERROR_FE)
 		{
@@ -485,8 +492,14 @@ void appendEscapedString(const char *str)
 
 bool CWJAP()
 {
-	sendCWJAP = true;
 	getWifiCred();
+	if (Credentials.SSID[0] == 0 || Credentials.Password[0] == 0)
+	{
+		Info("No SSID or Password configured, use WiFi credentials configured via ESP AP");
+		return true;
+	}
+
+	sendCWJAP = true;
 	static char atCommandBuff[100];
 	memset(atCommandBuff, '\0', 100);
 	sprintf(atCommandBuff, "AT+CWJAP=\"%s\",\"%s\"\r\n", Credentials.SSID, Credentials.Password);
@@ -896,10 +909,15 @@ ESP_States ESP_Upkeep(void)
 	{
 
 	case ESP_STATE_IDLE:
-		if(!ESPHandle->done){
+		if (ESPHandle->configAP) {
+			ESPHandle->timeOutStamp = HAL_GetTick() + 15000;
+			ESPHandle->state = ESP_STATE_CONFIG;
+			Debug("ESP_STATE_IDLE -> ESP_STATE_CONFIG");
+		} else if(!ESPHandle->done){
 			ESPHandle->timeOutStamp = HAL_GetTick() + 15000;
 			ESPHandle->state = ESP_STATE_INIT;
 			EspTurnedOn = false;
+			Debug("ESP_STATE_IDLE -> ESP_STATE_INIT");
 		}
 		// Waiting for wake up call.
 		break;
@@ -917,6 +935,7 @@ ESP_States ESP_Upkeep(void)
 		if (ESP_Receive(RxBuffer, ESP_MAX_BUFFER_SIZE))
 		{
 			ESPHandle->state = ESP_STATE_WAIT_AWAKE;
+			Debug("ESP_STATE_INIT -> ESP_STATE_WAIT_AWAKE");
 		}
 		break;
 
@@ -927,6 +946,7 @@ ESP_States ESP_Upkeep(void)
 		if (proceed || TimestampIsReached(timeoutTimer))
 		{
 			ESPHandle->state = ESP_STATE_MODE_SELECT;
+			Debug("ESP_STATE_WAIT_AWAKE -> ESP_STATE_MODE_SELECT");
 		}
 		break;
 
@@ -935,7 +955,9 @@ ESP_States ESP_Upkeep(void)
 		if (ESPHandle->mode == ESP_PROGRAM_INIT)
 		{
 			memcpy(ATCommandArray, AT_INIT, sizeof(AT_INIT));
+			Debug("ATCommand set to AT_INIT");
 			ESPHandle->state = ESP_STATE_SEND;
+			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
 			Mode = AT_MODE_INIT;
 			ATCommand = ATCommandArray[ATCounter];
@@ -944,7 +966,9 @@ ESP_States ESP_Upkeep(void)
 		if (ESPHandle->mode == ESP_PROGRAM_SET_CONN)  // Still necesary?
 		{
 			memcpy(ATCommandArray, AT_WIFI_CONFIG, sizeof(AT_WIFI_CONFIG));
+			Debug("ATCommand set to AT_WIFI_CONFIG");
 			ESPHandle->state = ESP_STATE_SEND;
+			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
 			Mode = AT_MODE_CONFIG;
 			ATCommand = ATCommandArray[ATCounter];
@@ -953,7 +977,9 @@ ESP_States ESP_Upkeep(void)
 		if (ESPHandle->mode == ESP_PROGRAM_TEST)
 		{
 			memcpy(ATCommandArray, AT_LOGIN, sizeof(AT_LOGIN));
+			Debug("ATCommand set to AT_LOGIN");
 			ESPHandle->state = ESP_STATE_SEND;
+			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
 			Mode = AT_MODE_TEST;
 			ATCommand = ATCommandArray[ATCounter];
@@ -962,7 +988,9 @@ ESP_States ESP_Upkeep(void)
 		if (ESPHandle->mode == ESP_PROGRAM_SEND)
 		{
 			memcpy(ATCommandArray, AT_SEND, sizeof(AT_SEND));
+			Debug("ATCommand set to AT_SEND");
 			ESPHandle->state = ESP_STATE_SEND;
+			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
 			Mode = AT_MODE_SEND;
 			start = HAL_GetTick();
@@ -970,12 +998,14 @@ ESP_States ESP_Upkeep(void)
 			ATCommand = ATCommandArray[ATCounter];
 			ATExpectation = RECEIVE_EXPECTATION_OK;
 		}
-		if (ESPHandle->mode == ESP_PROGRAM_RECONFIG)
+		if (ESPHandle->mode == ESP_PROGRAM_CONFIG_AP)
 		{
 			memcpy(ATCommandArray, AT_WIFI_RECONFIG, sizeof(AT_WIFI_RECONFIG));
+			Debug("ATCommand set to AT_WIFI_RECONFIG");
 			Debug("Reconfig mode voor local wifi config selected");
 			//DisableConnectedDevices();
 			ESPHandle->state = ESP_STATE_SEND;
+			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
 			Mode = AT_MODE_RECONFIG;
 			// SetESPIndicator();
@@ -985,7 +1015,9 @@ ESP_States ESP_Upkeep(void)
 		if (ESPHandle->mode == ESP_PROGRAM_RTC)			//TIME REQ
 		{
 			memcpy(ATCommandArray, AT_SNTP, sizeof(AT_SNTP));
+			Debug("ATCommand set to AT_SNTP");
 			ESPHandle->state = ESP_STATE_SEND;
+			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
 			Mode = AT_MODE_GETTIME;
 			start = HAL_GetTick();
@@ -996,8 +1028,10 @@ ESP_States ESP_Upkeep(void)
 		break;
 
 	case ESP_STATE_SEND: 
-		if(AT_Send(ATCommand))
+		if(AT_Send(ATCommand)) {
 			ESPHandle->state = ESP_STATE_WAIT_FOR_REPLY;
+			Debug("ESP_STATE_SEND -> ESP_STATE_WAIT_FOR_REPLY");
+		}
 		break;
 
 	case ESP_STATE_WAIT_FOR_REPLY:
@@ -1017,6 +1051,7 @@ ESP_States ESP_Upkeep(void)
 					ATCounter = 1;
 				}
 				ESPHandle->state = ESP_STATE_SEND;
+				Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
 				errorcntr++;
 				if (errorcntr >= ESP_MAX_RETRANSMITIONS)
 				{
@@ -1026,6 +1061,7 @@ ESP_States ESP_Upkeep(void)
 					stop = HAL_GetTick();
 					Error("ESP to many retransmits, terminated after %lu ms", (stop - start));
 					ESPHandle->state = ESP_STATE_DEINIT;
+					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_DEINIT");
 				}
 			}
 			if (ATReceived == RECEIVE_STATUS_INCOMPLETE)
@@ -1043,10 +1079,12 @@ ESP_States ESP_Upkeep(void)
 					stop = HAL_GetTick();
 					Error("ESP to many timeouts, terminated after %lu ms", (stop - start));
 					ESPHandle->state = ESP_STATE_DEINIT;
+					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_DEINIT");
 				}
 				if (ATCommand != AT_SENDDATA)
 				{
 					ESPHandle->state = ESP_STATE_SEND;
+					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
 				}
 				else
 				{
@@ -1054,11 +1092,13 @@ ESP_States ESP_Upkeep(void)
 					ATCounter -= 1;
 					ATExpectation = RECEIVE_EXPECTATION_START;
 					ESPHandle->state = ESP_STATE_SEND;
+					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
 				}
 			}
 			if (proceed)
 			{	
 				ESPHandle->state = ESP_STATE_NEXT_AT;
+				Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_NEXT_AT");
 			}
 		}
  		break;
@@ -1083,6 +1123,7 @@ ESP_States ESP_Upkeep(void)
 			ATExpectation = RECEIVE_EXPECTATION_TIME;
 		}
 		ESPHandle->state = ESP_STATE_SEND;
+		Debug("ESP_STATE_NEXT_AT -> ESP_STATE_SEND");
 		if (ATCommand == AT_END)
 		{
 			if(ESPHandle->mode == ESP_PROGRAM_INIT || ESPHandle->mode == ESP_PROGRAM_SET_CONN){
@@ -1097,6 +1138,7 @@ ESP_States ESP_Upkeep(void)
 					ESPHandle->mode = ESP_PROGRAM_RTC;
 				}
 				ESPHandle->state = ESP_STATE_IDLE;
+				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
 			}
 			else if (ESPHandle->mode == ESP_PROGRAM_SEND)
 			{
@@ -1111,6 +1153,7 @@ ESP_States ESP_Upkeep(void)
 				// if(lastUpdateMonth != RTC_GetMonth())
 				// 	ESPHandle->mode = ESP_PROGRAM_RTC;
 				ESPHandle->state = ESP_STATE_IDLE; //ESP_STATE_DEINIT;
+				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
 			}
 			else if (ESPHandle->mode == ESP_PROGRAM_RTC)  //TIME REQ
 			{
@@ -1124,18 +1167,25 @@ ESP_States ESP_Upkeep(void)
 				Info("Message time update in %lu ms", (stop - start));
 				ESPHandle->mode = ESP_PROGRAM_SEND;
 				ESPHandle->state = ESP_STATE_IDLE;
+				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
 			}
 			else
 			{
 				ESPHandle->state = ESP_STATE_IDLE;
+				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
 			}
 		}
 		break;
+    case ESP_STATE_CONFIG:
+      Debug("Do nothing until reset");
+      Process_PC_Config(GetUsbRxPointer());
 
+      break;
 	default:
 		// Handle unexpected state
 		Error("Something unknown went wrong with the ESP_STATE");
 		ESPHandle->state = ESP_STATE_INIT;
+		Debug("unexpected state -> ESP_STATE_INIT");
 		break;
 	}
 	return ESPHandle->state;

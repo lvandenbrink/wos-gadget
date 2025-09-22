@@ -60,6 +60,7 @@ typedef enum {
     GADGET_BATTERY_CHECK,
     GADGET_START_MEASUREMENTS,
     GADGET_CHECK_MEASUREMENTS_DONE,
+    GADGET_CONFIG_MODE,
     GADGET_SEND_MEASUREMENTS,
     GADGET_GO_TO_SLEEP,
     GADGET_REINIT_UART,
@@ -114,6 +115,7 @@ ESPHandler espHandle = {
     .resume = false,
     .startSend = false,
     .connectionMade = false,
+    .configAP = false,
     .mode = ESP_PROGRAM_INIT
 };
 
@@ -252,7 +254,14 @@ int main(void)
         static Battery_Status batteryCheck;
         static gadgetState state = GADGET_BATTERY_CHECK;
         static uint16_t sleepTime = SLEEP_TIME;
-        processButtonPressed();
+        bool reconfig = processButtonPressed();
+        if (reconfig && state != GADGET_CONFIG_MODE){
+            Debug("User button pressed, entering reconfig mode");
+            espHandle.mode = ESP_PROGRAM_CONFIG_AP;
+            espHandle.configAP = true;
+            state = GADGET_CONFIG_MODE;
+        }
+
         petDog();
         switch(state){
             case GADGET_BATTERY_CHECK:
@@ -305,9 +314,16 @@ int main(void)
                   //espHandle.mode = ESP_PROGRAM_INIT;
                   espHandle.startSend = false;
                   state = GADGET_GO_TO_SLEEP;
-              }
-                  
+              } 
             break;
+
+            case GADGET_CONFIG_MODE:
+                ESP_Upkeep();
+                HAL_GPIO_WritePin(MCU_LED_C_R_GPIO_Port, MCU_LED_C_R_Pin, true);
+                HAL_Delay(200);
+                HAL_GPIO_WritePin(MCU_LED_C_R_GPIO_Port, MCU_LED_C_R_Pin, false);
+                HAL_Delay(200);
+              break;
 
             case GADGET_GO_TO_SLEEP:
                 DisableESP();

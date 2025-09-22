@@ -26,7 +26,7 @@ Battery_Status Battery_Upkeep();
 uint16_t Calculate_LED_ON();
 void InitDone();
 void GoToSleep(uint16_t sleepTime);
-void processButtonPressed();
+bool processButtonPressed();
 bool UsbPowered();
 void LEDSOff();
 #endif /* INC_STATUSCHECK_H_ */

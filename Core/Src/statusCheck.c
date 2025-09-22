@@ -118,7 +118,7 @@ void GoToSleep(uint16_t sleepTime){
   HAL_ResumeTick();
 }
 
-void processButtonPressed(){
+bool processButtonPressed(){
   static uint32_t pressTime;
   static uint32_t holdTime;
   if(UserButton_Pressed() && BootButton_Pressed()){
@@ -130,11 +130,17 @@ void processButtonPressed(){
         petDog();
       }
     }
+  } else if(UserButton_Pressed()){
+    holdTime = HAL_GetTick();
+    if((holdTime - pressTime) > 2000){
+        return true;
+    }
   }
   else{
     pressTime = HAL_GetTick();
     holdTime = HAL_GetTick();
   }
+  return false;
 }
 
 /*
