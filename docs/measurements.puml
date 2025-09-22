@@ -1,0 +1,70 @@
+@startuml Measurement_State_Diagram
+
+!theme plain
+
+[*] --> MEASURE_STATE_INIT
+
+state MEASURE_STATE_INIT {
+    MEASURE_STATE_INIT : hydroTempInit(&measurementHandler.HT)
+    MEASURE_STATE_INIT : initDB(&measurementHandler.MIC)
+    MEASURE_STATE_INIT : initVOC(&measurementHandler.VOC)
+    MEASURE_STATE_INIT : initSens(&measurementHandler.Sens)
+    MEASURE_STATE_INIT : initVariableLink()
+    MEASURE_STATE_INIT : probe_sen5x()
+}
+
+state MEASURE_STATE_START {
+    MEASURE_STATE_START : Set all resume flags to true
+    MEASURE_STATE_START : measurementHandler.HT.resume = true
+    MEASURE_STATE_START : measurementHandler.MIC.resume = true
+    MEASURE_STATE_START : measurementHandler.VOC.resume = true
+    MEASURE_STATE_START : measurementHandler.Sens.resume = true
+}
+
+state MEASURE_STATE_BUSY {
+    MEASURE_STATE_BUSY : HIDS_Upkeep() + petDog()
+    MEASURE_STATE_BUSY : Mic_Upkeep() + petDog()
+    MEASURE_STATE_BUSY : SGP_Upkeep() + petDog()
+    MEASURE_STATE_BUSY : sen5x_statemachine() (conditional)
+    MEASURE_STATE_BUSY : checkDone()
+    MEASURE_STATE_BUSY : LED status update on completion
+}
+
+state MEASURE_STATE_IDLE {
+    MEASURE_STATE_IDLE : isDone = true
+    MEASURE_STATE_IDLE : Measurements complete
+    MEASURE_STATE_IDLE : Ready for transmission
+}
+
+MEASURE_STATE_INIT --> MEASURE_STATE_START : Sensors initialized
+
+MEASURE_STATE_START --> MEASURE_STATE_BUSY : Resume flags set
+
+MEASURE_STATE_BUSY --> MEASURE_STATE_BUSY : Measurements running\ncheckDone() == false
+MEASURE_STATE_BUSY --> MEASURE_STATE_IDLE : measurementsDone == true\nGreen LED on, Blue LED off
+
+MEASURE_STATE_IDLE --> MEASURE_STATE_START : measurementsDone == false\n(restart cycle)
+MEASURE_STATE_IDLE --> [*] : isDone == true\n(return to main loop)
+
+note right of MEASURE_STATE_BUSY
+  Measurement Completion Check:
+  All sensors must be done:
+  • MIC.measurementDone == true
+  • HT.measurementDone == true  
+  • VOC.measurementDone == true
+  • Sens.measurementDone == true (if active)
+  
+  Watchdog Protection:
+  • petDog() called after each sensor
+end note
+
+note left of MEASURE_STATE_IDLE
+  LED Indicators:
+  • Green LED on (MCU_LED_C_G_Pin = true)
+  • Blue LED off (MCU_LED_C_B_Pin = false)
+  
+  Return Value:
+  • isDone = true signals main loop
+end note
+
+@enduml

@@ -1,0 +1,146 @@
+@startuml ESP_STATE_Diagram
+
+!theme plain
+
+[*] --> ESP_STATE_IDLE
+
+state ESP_STATE_IDLE {
+    ESP_STATE_IDLE : Wait for wake up call
+    ESP_STATE_IDLE : Check ESPHandle->done flag
+    ESP_STATE_IDLE : Check ESPHandle->configAP flag
+    ESP_STATE_IDLE : Set 15s timeout if starting
+}
+
+state ESP_STATE_INIT {
+    ESP_STATE_INIT : resetESP() if not turned on
+    ESP_STATE_INIT : Start DMA buffer reading
+    ESP_STATE_INIT : ESPHandle->ready = true
+    ESP_STATE_INIT : EspTurnedOn = true
+    ESP_STATE_INIT : Set startup timeout
+}
+
+state ESP_STATE_WAIT_AWAKE {
+    ESP_STATE_WAIT_AWAKE : DMA_ProcessBuffer(READY)
+    ESP_STATE_WAIT_AWAKE : Wait for ESP ready signal
+    ESP_STATE_WAIT_AWAKE : Timeout protection
+    ESP_STATE_WAIT_AWAKE : ATCompare() validation
+}
+
+state ESP_STATE_MODE_SELECT {
+    ESP_STATE_MODE_SELECT : Clear ATCommandArray with AT_END
+    ESP_STATE_MODE_SELECT : Select based on ESPHandle->mode:
+    ESP_STATE_MODE_SELECT : • ESP_PROGRAM_INIT → AT_INIT
+    ESP_STATE_MODE_SELECT : • ESP_PROGRAM_SET_CONN → AT_WIFI_CONFIG  
+    ESP_STATE_MODE_SELECT : • ESP_PROGRAM_SEND → AT_SEND
+    ESP_STATE_MODE_SELECT : • ESP_PROGRAM_TEST → AT_LOGIN
+    ESP_STATE_MODE_SELECT : • ESP_PROGRAM_CONFIG_AP → AT_WIFI_RECONFIG
+    ESP_STATE_MODE_SELECT : • ESP_PROGRAM_RTC → AT_SNTP
+    ESP_STATE_MODE_SELECT : Set ATCounter = 0, Mode, ATExpectation
+}
+
+state ESP_STATE_SEND {
+    ESP_STATE_SEND : Call AT_Send(ATCommand)
+    ESP_STATE_SEND : Debug only prints on success
+    ESP_STATE_SEND : State only changes if AT_Send() true
+}
+
+state ESP_STATE_WAIT_FOR_REPLY {
+    ESP_STATE_WAIT_FOR_REPLY : Wait for ESPTimeStamp
+    ESP_STATE_WAIT_FOR_REPLY : DMA_ProcessBuffer(ATExpectation)
+    ESP_STATE_WAIT_FOR_REPLY : ATCompare() validation
+    ESP_STATE_WAIT_FOR_REPLY : Handle ERROR, TIMEOUT, INCOMPLETE
+    ESP_STATE_WAIT_FOR_REPLY : Manage retry/timeout counters
+    ESP_STATE_WAIT_FOR_REPLY : Special error handling per command
+}
+
+state ESP_STATE_NEXT_AT {
+    ESP_STATE_NEXT_AT : ATCounter++
+    ESP_STATE_NEXT_AT : ATCommand = ATCommandArray[ATCounter]
+    ESP_STATE_NEXT_AT : Set ATExpectation based on command:
+    ESP_STATE_NEXT_AT : • AT_RESTORE → READY
+    ESP_STATE_NEXT_AT : • AT_HTTPCPOST → START
+    ESP_STATE_NEXT_AT : • AT_CIPSNTPCFG → TIME
+    ESP_STATE_NEXT_AT : • Others → OK
+    ESP_STATE_NEXT_AT : Handle AT_END completion logic
+}
+
+state ESP_STATE_CONFIG {
+    ESP_STATE_CONFIG : Process PC configuration commands
+}
+
+state ESP_STATE_DEINIT {
+    ESP_STATE_DEINIT : Reset error counters
+}
+
+ESP_STATE_IDLE --> ESP_STATE_INIT : !ESPHandle->done
+ESP_STATE_IDLE --> ESP_STATE_CONFIG : ESPHandle->configAP
+ESP_STATE_IDLE --> ESP_STATE_IDLE : ESPHandle->done
+
+ESP_STATE_INIT --> ESP_STATE_WAIT_AWAKE : ESP_Receive() success
+ESP_STATE_INIT --> ESP_STATE_INIT : ESP not ready
+
+ESP_STATE_WAIT_AWAKE --> ESP_STATE_MODE_SELECT : READY received OR timeout
+ESP_STATE_WAIT_AWAKE --> ESP_STATE_WAIT_AWAKE : Still waiting
+
+ESP_STATE_MODE_SELECT --> ESP_STATE_SEND : Mode selected & commands set
+
+ESP_STATE_SEND --> ESP_STATE_WAIT_FOR_REPLY : AT_Send() returns true
+ESP_STATE_SEND --> ESP_STATE_SEND : AT_Send() returns false
+
+ESP_STATE_WAIT_FOR_REPLY --> ESP_STATE_NEXT_AT : Response OK
+ESP_STATE_WAIT_FOR_REPLY --> ESP_STATE_SEND : Error (retry < max)
+ESP_STATE_WAIT_FOR_REPLY --> ESP_STATE_DEINIT : Max retries exceeded
+ESP_STATE_WAIT_FOR_REPLY --> ESP_STATE_WAIT_FOR_REPLY : Incomplete/waiting
+
+ESP_STATE_NEXT_AT --> ESP_STATE_SEND : ATCommand != AT_END
+ESP_STATE_NEXT_AT --> ESP_STATE_IDLE : ATCommand == AT_END
+
+ESP_STATE_CONFIG --> ESP_STATE_CONFIG : Process USB config commands
+
+ESP_STATE_DEINIT --> ESP_STATE_IDLE
+
+
+note right of ESP_STATE_MODE_SELECT
+  ESP Program Modes:
+  • ESP_PROGRAM_INIT: Full initialization
+  • ESP_PROGRAM_SET_CONN: WiFi connection only
+  • ESP_PROGRAM_TEST: Connection test
+  • ESP_PROGRAM_SEND: Send data via HTTP
+  • ESP_PROGRAM_CONFIG_AP: Access Point mode
+  • ESP_PROGRAM_RTC: Time synchronization
+end note
+
+note left of ESP_STATE_WAIT_FOR_REPLY
+  Error Recovery:
+  • RECEIVE_STATUS_ERROR → Retry or switch command
+  • RECEIVE_STATUS_TIMEOUT → Increment timeout counter
+  • RECEIVE_STATUS_INCOMPLETE → Wait 10ms more
+  
+  Special Error Handling:
+  • AT_CWJAP error → ErrorBlinkWiFi()
+  • AT_SENDDATA error → Switch to AT_HTTPCPOST
+  
+  Max Retries/Timeouts:
+  • errorcntr >= ESP_MAX_RETRANSMITIONS → DEINIT
+  • timeoutcntr >= ESP_MAX_RETRANSMITIONS → DEINIT
+end note
+
+note bottom of ESP_STATE_NEXT_AT
+  Sequence Completion Logic:
+  • ESP_PROGRAM_INIT/SET_CONN: Check connection success
+    - If failed: ErrorBlinkWiFi(), switch to ESP_PROGRAM_SET_CONN
+    - If success: Switch to ESP_PROGRAM_RTC
+  • ESP_PROGRAM_SEND: Set done=true, log timing
+  • ESP_PROGRAM_RTC: Switch to ESP_PROGRAM_SEND mode
+  • Connection failed: Switch to ESP_PROGRAM_SET_CONN
+end note
+
+note right of ESP_STATE_CONFIG
+  Configuration Mode:
+  • Processes USB configuration commands
+  • No automatic state transitions
+  • Requires external reset to exit
+  • Used for device configuration via USB
+end note
+
+@enduml

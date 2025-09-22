@@ -1,0 +1,126 @@
+@startuml Main_Thread_State_Diagram
+
+!theme plain
+
+[*] --> GADGET_BATTERY_CHECK
+
+state GADGET_BATTERY_CHECK {
+    GADGET_BATTERY_CHECK : Battery_Upkeep()
+    GADGET_BATTERY_CHECK : Set sleepTime based on battery
+    GADGET_BATTERY_CHECK : processButtonPressed()
+    GADGET_BATTERY_CHECK : petDog()
+    GADGET_BATTERY_CHECK : Check user button for reconfig
+}
+
+state GADGET_START_MEASUREMENTS {
+    GADGET_START_MEASUREMENTS : measurementReset()
+    GADGET_START_MEASUREMENTS : measurementUpkeep()
+    GADGET_START_MEASUREMENTS : Start sensor collection
+}
+
+state GADGET_CHECK_MEASUREMENTS_DONE {
+    GADGET_CHECK_MEASUREMENTS_DONE : measurementUpkeep()
+    GADGET_CHECK_MEASUREMENTS_DONE : Wait for completion
+    GADGET_CHECK_MEASUREMENTS_DONE : Monitor sensors
+}
+
+state GADGET_SEND_MEASUREMENTS {
+    GADGET_SEND_MEASUREMENTS : ESP_Upkeep()
+    GADGET_SEND_MEASUREMENTS : Blue LED off
+    GADGET_SEND_MEASUREMENTS : espHandle.startSend = true
+    GADGET_SEND_MEASUREMENTS : Monitor timeout (60s)
+    GADGET_SEND_MEASUREMENTS : Flash red LED on timeout
+}
+
+state GADGET_CONFIG_MODE {
+    GADGET_CONFIG_MODE : ESP_Upkeep()
+    GADGET_CONFIG_MODE : Red LED blink pattern
+    GADGET_CONFIG_MODE : ESP Access Point mode
+    GADGET_CONFIG_MODE : WiFi configuration via web interface
+    GADGET_CONFIG_MODE : 200ms on/off cycle
+}
+
+state GADGET_GO_TO_SLEEP {
+    GADGET_GO_TO_SLEEP : DisableESP()
+    GADGET_GO_TO_SLEEP : HAL_UART_DeInit(&huart4)
+    GADGET_GO_TO_SLEEP : LEDSOff()
+    GADGET_GO_TO_SLEEP : watchdogStopMode(sleepTime)
+    GADGET_GO_TO_SLEEP : espHandle.done = false
+}
+
+state GADGET_REINIT_UART {
+    GADGET_REINIT_UART : MX_USART4_UART_Init()
+    GADGET_REINIT_UART : initUart(&huart4)
+    GADGET_REINIT_UART : measurementReset()
+}
+
+GADGET_BATTERY_CHECK --> GADGET_START_MEASUREMENTS : BATTERY_GOOD || USB_PLUGGED_IN || BATTERY_LOW
+GADGET_BATTERY_CHECK --> GADGET_GO_TO_SLEEP : BATTERY_CRITICAL
+GADGET_BATTERY_CHECK --> GADGET_CONFIG_MODE : processButtonPressed() && reconfig
+
+GADGET_START_MEASUREMENTS --> GADGET_CHECK_MEASUREMENTS_DONE
+
+GADGET_CHECK_MEASUREMENTS_DONE --> GADGET_CHECK_MEASUREMENTS_DONE : measurementDone == false
+GADGET_CHECK_MEASUREMENTS_DONE --> GADGET_SEND_MEASUREMENTS : measurementDone == true\nSet espHandle.startSend = true\nSet 60s timeout
+
+GADGET_SEND_MEASUREMENTS --> GADGET_SEND_MEASUREMENTS : ESP processing
+GADGET_SEND_MEASUREMENTS --> GADGET_GO_TO_SLEEP : espHandle.done == true
+GADGET_SEND_MEASUREMENTS --> GADGET_GO_TO_SLEEP : TimestampIsReached(timeout)\nFlash red LED
+
+GADGET_CONFIG_MODE --> GADGET_CONFIG_MODE : Continuous AP mode\nNo automatic exit
+
+GADGET_GO_TO_SLEEP --> GADGET_REINIT_UART : After sleep period
+
+GADGET_REINIT_UART --> GADGET_BATTERY_CHECK
+
+note right of GADGET_BATTERY_CHECK
+  Continuous Actions:
+  • processButtonPressed() - Check for user input
+  • petDog() - watchdog refresh
+  • ESP_Programming_Read_Remaining_DMA()
+  
+  Sleep Time Settings:
+  • BATTERY_GOOD: 300 seconds (SEND_WAIT_TIME_SHORT)
+  • BATTERY_LOW: 600 seconds (SEND_WAIT_TIME_LONG)
+  • USB_PLUGGED_IN: 300 seconds
+  • BATTERY_CRITICAL: 600 seconds (sleep only)
+  
+  Button Reconfig:
+  • Sets espHandle.mode = ESP_PROGRAM_CONFIG_AP
+  • Sets espHandle.configAP = true
+  • Transitions to GADGET_CONFIG_MODE
+end note
+
+note right of GADGET_SEND_MEASUREMENTS
+  LED Indicators:
+  • Blue LED off during transmission
+  • Red LED flash (1s) on timeout
+  • Timeout after 60 seconds
+  • espHandle.timeOutStamp = HAL_GetTick() + 60000
+  
+  Timeout Recovery:
+  • Reset ESP state to ESP_STATE_INIT
+  • Clear espHandle.startSend
+  • Transition to sleep mode
+end note
+
+note left of GADGET_CONFIG_MODE
+  Access Point Configuration:
+  • ESP in AP mode (ESP_PROGRAM_CONFIG_AP)
+  • Red LED blink: 200ms on/off cycle
+  • Web interface for WiFi configuration
+  • No automatic exit - requires manual reset
+  • Continuous ESP_Upkeep() processing
+end note
+
+note left of GADGET_GO_TO_SLEEP
+  Power Saving Mode:
+  • Disable ESP module
+  • Deinitialize UART4
+  • Turn off all LEDs
+  • Enter watchdog stop mode
+  • Sleep duration based on battery level
+  • Reset espHandle.done = false
+end note
+
+@enduml
