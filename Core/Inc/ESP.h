@@ -17,6 +17,7 @@
 #include "PC_Config.h"
 #include "statusCheck.h"
 
+#define MQTT_DATAGRAM
 //#define LONGMESSAGES true  // show long messages f.i. the datagram on debug UART
 #define LONGDATAGRAM
 #define ESP_MAX_UART_RETRIES 2
@@ -98,6 +99,10 @@ typedef enum {
   AT_WEBSERVER,
   AT_HTTPCPOST,
   AT_SENDDATA,
+  AT_MQTTUSERCFG,
+  AT_MQTTCONN,
+  AT_MQTTPUB,
+  AT_MQTTCLEAN,
   AT_CIPSNTPCFG,
   AT_CIPSNTPTIME,
   AT_CIPSNTPINTV,
@@ -111,6 +116,15 @@ typedef struct {
   char SSID[32];
   char Password[64];
 }WifiConfig;
+
+typedef struct {
+  char broker[64];
+  uint16_t port;
+  char clientId[32];
+  char topic[64];
+  char username[32];
+  char password[32];
+}MqttConfig;
 
 typedef struct {
   char User[30];
@@ -156,6 +170,11 @@ void getWifiCred(void);
 void initVariableLink(SensorType2* HT, SensorType1* VOC, SensorType1* DB, SensorType3* Sens);
 void SetConfigMode();
 void forceNTPupdate();
+
+const char* ESPStateToString(uint8_t state);
+const char* ATCommandToString(AT_Commands cmd);
+const char* ATModeToString(AT_Mode mode);
+const char* ATExpectationToString(AT_Expectation exp);
 
 #endif /* INC_ESP_H_ */
 

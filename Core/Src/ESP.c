@@ -46,12 +46,22 @@ SensorType1 *DBLink = NULL;
 SensorType3 *SensLink = NULL; 
 
 WifiConfig Credentials;
+MqttConfig MqttCredentials = {
+    .broker = "192.168.1.184",
+    .port = 1883,
+    .clientId = "wos-gadget",
+    .topic = "sensors/wos",
+    .username = "client1",
+    .password = "12345"
+};
+static const bool SentHTTPPost = false;
 
 static char message[1152];
 static const char API[] = "\"http://192.168.1.184:9000/test";
 static AT_Commands ATCommandArray[10];
-static AT_Commands AT_INIT[] = {AT_WAKEUP, AT_SET_RFPOWER, AT_CHECK_RFPOWER, AT_CWINIT, AT_CWAUTOCONN, AT_CWMODE1, AT_CWJAP, AT_CIPMUX};
-static AT_Commands AT_SEND[] = {AT_WAKEUP, AT_HTTPCPOST, AT_SENDDATA}; 
+static AT_Commands AT_INIT[] = {AT_WAKEUP, AT_SET_RFPOWER, AT_CHECK_RFPOWER, AT_CWINIT, AT_CWAUTOCONN, AT_CWMODE1, AT_CIPMUX};
+static AT_Commands AT_SEND_HTTP[] = {AT_WAKEUP, AT_HTTPCPOST, AT_SENDDATA};
+static AT_Commands AT_SEND_MQTT[] = {AT_WAKEUP, AT_MQTTUSERCFG, AT_MQTTCONN, AT_MQTTPUB, AT_SENDDATA, AT_MQTTCLEAN};
 static AT_Commands AT_LOGIN[] = {AT_WAKEUP, AT_CWSTATE};
 static AT_Commands AT_WIFI_CONFIG[] = {AT_WAKEUP, AT_CWINIT, AT_CWMODE3, AT_CWAUTOCONN, AT_CWJAP, AT_CIPMUX};
 static AT_Commands AT_WIFI_RECONFIG[] = {AT_WAKEUP, AT_CWMODE3, AT_CWSAP, AT_CIPMUX, AT_WEBSERVER};
@@ -310,6 +320,56 @@ uint16_t CreateMessage()
 	// get name etc from EEprom
 	Debug("sensorid voor opensensmaps nox: %d", noxConfig);
 	setCharges();
+#ifdef MQTT_DATAGRAM
+	memset(message, '\0', 1152);
+	uint16_t index = 0;
+	sprintf(&message[index], "{");
+	index = strlen(message);
+
+	Debug("The temperature value = %2.2f", HTLink->measurementValue1);
+	sprintf(&message[index], "\"temperature\":%.2f,", HTLink->measurementValue1);
+	index = strlen(message);
+
+	sprintf(&message[index], "\"humidity\":%.1f,", HTLink->measurementValue2);
+	index = strlen(message);
+
+	sprintf(&message[index], "\"sound\":%.2f,", DBLink->measurementValue);
+	index = strlen(message);
+
+	sprintf(&message[index], "\"battery\":%.2f,", batteryCharge);
+	index = strlen(message);
+
+	if(!SensLink->active){
+		Info("Sens5 not active");
+		sprintf(&message[index], "\"voc\":%d,", (uint16_t)VOCLink->measurementValue);
+		index = strlen(message);
+
+		sprintf(&message[index], "\"battery\":%.2f", solarCharge);
+		index = strlen(message);
+	}
+
+	if(SensLink->active){
+		sprintf(&message[index], "\"voc\":%d,", (uint16_t)VOCLink->measurementValue);
+		index = strlen(message);
+
+		sprintf(&message[index], "\"battery\":%.2f", solarCharge);
+		index = strlen(message);
+
+		if(PM25Active()){
+			sprintf(&message[index], "\"PM2.5\":%.2f,", SensLink->measurementValue1/10.0f);
+			index = strlen(message);
+		}
+		else{
+			sprintf(&message[index], "\"PM10\":%.2f,", SensLink->measurementValue2/10.0f);
+			index = strlen(message);
+		}
+
+		sprintf(&message[index], "\"NOx\":%.2f", SensLink->measurementValue4/10.0f);
+		index = strlen(message);
+	}
+	Debug("Length of datagram: %d", index);
+	index = sprintf(&message[index], "}");
+#else
 #ifdef LONGDATAGRAM
 	memset(message, '\0', 1152);
 	uint16_t index = 0;
@@ -397,6 +457,7 @@ uint16_t CreateMessage()
 #endif
 	Debug("Length of datagram: %d", index);
 	index = sprintf(&message[index], "]");
+#endif
 	return strlen(message);
 }
 
@@ -541,17 +602,55 @@ bool WEBSERVER()
 bool HTTPCPOST()
 {
 	uint16_t length = CreateMessage();
-		static uint8_t boxConfig[IdSize];
-		static char Buffer[25];
-		ReadUint8ArrayEEprom(BoxConfigAddr, boxConfig, IdSize);
-		uint8ArrayToString(Buffer, boxConfig);
-		sprintf(atCommandBuff, "AT+HTTPCPOST=%s%s/data\",%d,1,\"content-type: application/json\"\r\n", API, Buffer, length);
+	static uint8_t boxConfig[IdSize];
+	static char Buffer[25];
+	ReadUint8ArrayEEprom(BoxConfigAddr, boxConfig, IdSize);
+	uint8ArrayToString(Buffer, boxConfig);
+	sprintf(atCommandBuff, "AT+HTTPCPOST=%s%s/data\",%d,1,\"content-type: application/json\"\r\n", API, Buffer, length);
 	return ESP_Send(atCommandBuff); // && ReadyToSendMeasurement) //Gaat niet door de retry waar door die altijd fout gaat
 }
 
 bool SENDDATA()
 {
 	return ESP_Send(message);
+}
+
+// MQTT configuration and connection functions
+bool MQTTUSERCFG()
+{
+	// Set MQTT User Configuration.
+	// AT+MQTTUSERCFG=<LinkID>,<scheme>,<"client_id">,<"username">,<"password">,<cert_key_ID>,<CA_ID>,<"path">
+	sprintf(atCommandBuff, "AT+MQTTUSERCFG=0,1,\"%s\",\"%s\",\"%s\",0,0,\"\"\r\n", 
+		MqttCredentials.clientId, MqttCredentials.username, MqttCredentials.password);
+	return ESP_Send(atCommandBuff);
+}
+
+bool MQTTCONN()
+{
+	// Connect to MQTT broker
+	// AT+MQTTCONN=<LinkID>,<"host">,<port>,<reconnect>
+	// reconnect: 0=no auto reconnect, 1=auto reconnect (uses more resources)
+	sprintf(atCommandBuff, "AT+MQTTCONN=0,\"%s\",%d,0\r\n", MqttCredentials.broker, MqttCredentials.port);
+	return ESP_Send(atCommandBuff);
+}
+
+bool MQTTPUB()
+{
+	// Create the message content
+	uint16_t length = CreateMessage();
+	// Debug output to verify message content and length
+	Debug("MQTT Message (%u bytes): %s", length, message);
+	
+	// Publish MQTT message to a topic.
+	// AT+MQTTPUBRAW=<LinkID>,<"topic">,<length>,<qos>,<retain>
+	sprintf(atCommandBuff, "AT+MQTTPUBRAW=0,\"%s\",%u,0,0\r\n", MqttCredentials.topic, length);
+	return ESP_Send(atCommandBuff);
+}
+
+bool MQTTCLEAN()
+{
+	// Clean disconnect from MQTT broker
+	return ESP_Send("AT+MQTTCLEAN=0\r\n");
 }
 
 bool CIPSNTPCFG()
@@ -862,6 +961,33 @@ bool AT_Send(AT_Commands state)
 			return false;
 		}
 		break;
+	case AT_MQTTUSERCFG:
+		Debug("Configure MQTT user settings");
+		ATCommandSend = MQTTUSERCFG();
+		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
+		break;
+
+	case AT_MQTTCONN:
+		if (ESPHandle->startSend) {
+			Debug("Connect to MQTT broker");
+			ATCommandSend = MQTTCONN();
+			ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+		} else {
+			return false;
+		}
+		break;
+
+	case AT_MQTTPUB:
+		Debug("Publish MQTT message");
+		ATCommandSend = MQTTPUB();
+		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+		break;
+
+	case AT_MQTTCLEAN:
+		Debug("Clean disconnect from MQTT");
+		ATCommandSend = MQTTCLEAN();
+		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
+		break;
 
 	case AT_SENDDATA:
 		Debug("Send the data");
@@ -900,9 +1026,14 @@ ESP_States ESP_Upkeep(void)
 	if ((ESPHandle->state != oldEspState) && (GetVerboseLevel() == VERBOSE_ALL))
 	{
 		oldEspState = ESPHandle->state;
-		if (!((oldEspState == 3) && (ATCommand == AT_HTTPCPOST)))
+		if (!((oldEspState == 3) && (ATCommand == AT_HTTPCPOST || ATCommand == AT_MQTTPUB)))
 		{
-			Debug("EspState: %d ATcmd: %d Mode: %d ATExp: %d", oldEspState, ATCommand, Mode, ATExpectation);
+			// Debug("EspState: %d ATcmd: %d Mode: %d ATExp: %d", oldEspState, ATCommand, Mode, ATExpectation);
+			Debug("EspState: %s ATcmd: %s Mode: %s ATExp: %s",
+				ESPStateToString(oldEspState),
+				ATCommandToString(ATCommand),
+				ATModeToString(Mode),
+				ATExpectationToString(ATExpectation));
 		}
 	}
 	switch (ESPHandle->state)
@@ -987,8 +1118,17 @@ ESP_States ESP_Upkeep(void)
 		}
 		if (ESPHandle->mode == ESP_PROGRAM_SEND)
 		{
-			memcpy(ATCommandArray, AT_SEND, sizeof(AT_SEND));
-			Debug("ATCommand set to AT_SEND");
+			if (SentHTTPPost)
+			{
+				memcpy(ATCommandArray, AT_SEND_HTTP, sizeof(AT_SEND_HTTP));
+				Debug("ATCommand set to AT_SEND_HTTP");
+			}
+			else
+			{
+				memcpy(ATCommandArray, AT_SEND_MQTT, sizeof(AT_SEND_MQTT));
+				Debug("ATCommand set to AT_SEND_MQTT");
+			}
+			
 			ESPHandle->state = ESP_STATE_SEND;
 			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
 			ATCounter = 0;
@@ -1046,8 +1186,16 @@ ESP_States ESP_Upkeep(void)
 				}
 				if (ATCommand == AT_SENDDATA)
 				{
-					ATCommand = AT_HTTPCPOST;
-					ATExpectation = RECEIVE_EXPECTATION_START;
+					if (SentHTTPPost)
+					{
+						ATCommand = AT_HTTPCPOST;
+						ATExpectation = RECEIVE_EXPECTATION_START;
+					}
+					else
+					{
+						ATCommand = AT_MQTTUSERCFG;
+						ATExpectation = RECEIVE_EXPECTATION_OK;
+					}
 					ATCounter = 1;
 				}
 				ESPHandle->state = ESP_STATE_SEND;
@@ -1088,9 +1236,14 @@ ESP_States ESP_Upkeep(void)
 				}
 				else
 				{
-					ATCommand = AT_HTTPCPOST;
+					if (SentHTTPPost) {
+						ATCommand = AT_HTTPCPOST;
+						ATExpectation = RECEIVE_EXPECTATION_START;
+					} else {
+						ATCommand = AT_MQTTUSERCFG;
+						ATExpectation = RECEIVE_EXPECTATION_OK;
+					}
 					ATCounter -= 1;
-					ATExpectation = RECEIVE_EXPECTATION_START;
 					ESPHandle->state = ESP_STATE_SEND;
 					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
 				}
@@ -1110,11 +1263,15 @@ ESP_States ESP_Upkeep(void)
 		{
 			ATExpectation = RECEIVE_EXPECTATION_READY;
 		}
-		if (ATCommand == AT_HTTPCPOST)
+		if (ATCommand == AT_HTTPCPOST || ATCommand == AT_MQTTPUB)
 		{
 			ATExpectation = RECEIVE_EXPECTATION_START;
 		}
-		if (ATCommand != AT_HTTPCPOST && ATCommand != AT_RESTORE)
+		if (ATCommand != AT_HTTPCPOST && ATCommand != AT_RESTORE && ATCommand != AT_MQTTPUB)
+		{
+			ATExpectation = RECEIVE_EXPECTATION_OK;
+		}
+		if (ATCommand == AT_MQTTUSERCFG || ATCommand == AT_MQTTCONN || ATCommand == AT_MQTTCLEAN)
 		{
 			ATExpectation = RECEIVE_EXPECTATION_OK;
 		}
@@ -1135,7 +1292,8 @@ ESP_States ESP_Upkeep(void)
 					ESPHandle->mode = ESP_PROGRAM_SET_CONN;
 				}
 				else{
-					ESPHandle->mode = ESP_PROGRAM_RTC;
+					// ESPHandle->mode = ESP_PROGRAM_RTC;
+					ESPHandle->mode = ESP_PROGRAM_SEND;
 				}
 				ESPHandle->state = ESP_STATE_IDLE;
 				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
@@ -1183,10 +1341,78 @@ ESP_States ESP_Upkeep(void)
       break;
 	default:
 		// Handle unexpected state
-		Error("Something unknown went wrong with the ESP_STATE");
+		Error("Something unknown went wrong with the ESP_STATE: %s", ESPStateToString(ESPHandle->state));
 		ESPHandle->state = ESP_STATE_INIT;
 		Debug("unexpected state -> ESP_STATE_INIT");
 		break;
 	}
 	return ESPHandle->state;
+}
+
+
+const char* ESPStateToString(uint8_t state) {
+    switch(state) {
+        case ESP_STATE_IDLE: return "IDLE";
+        case ESP_STATE_INIT: return "INIT";
+        case ESP_STATE_WAIT_AWAKE: return "WAIT_AWAKE";
+        case ESP_STATE_MODE_SELECT: return "MODE_SELECT";
+        case ESP_STATE_SEND: return "SEND";
+        case ESP_STATE_WAIT_FOR_REPLY: return "WAIT_FOR_REPLY";
+        case ESP_STATE_NEXT_AT: return "NEXT_AT";
+        case ESP_STATE_CONFIG: return "CONFIG";
+        case ESP_STATE_DEINIT: return "DEINIT";
+        default: return "UNKNOWN_STATE";
+    }
+}
+
+const char* ATCommandToString(AT_Commands cmd) {
+    switch(cmd) {
+        case AT_WAKEUP: return "WAKEUP";
+        case AT_SET_RFPOWER: return "SET_RFPOWER";
+        case AT_CHECK_RFPOWER: return "CHECK_RFPOWER";
+        case AT_RESTORE: return "RESTORE";
+        case AT_CWINIT: return "CWINIT";
+        case AT_CWSTATE: return "CWSTATE";
+        case AT_CWMODE1: return "CWMODE1";
+        case AT_CWMODE2: return "CWMODE2";
+        case AT_CWMODE3: return "CWMODE3";
+        case AT_CWAUTOCONN: return "CWAUTOCONN";
+        case AT_CWJAP: return "CWJAP";
+        case AT_CWSAP: return "CWSAP";
+        case AT_CIPMUX: return "CIPMUX";
+        case AT_WEBSERVER: return "WEBSERVER";
+        case AT_HTTPCPOST: return "HTTPCPOST";
+        case AT_SENDDATA: return "SENDDATA";
+        case AT_MQTTUSERCFG: return "MQTTUSERCFG";
+        case AT_MQTTCONN: return "MQTTCONN";
+        case AT_MQTTPUB: return "MQTTPUB";
+        case AT_MQTTCLEAN: return "MQTTCLEAN";
+        case AT_CIPSNTPCFG: return "CIPSNTPCFG";
+        case AT_CIPSNTPTIME: return "CIPSNTPTIME";
+        case AT_CIPSNTPINTV: return "CIPSNTPINTV";
+        case AT_END: return "END";
+        default: return "UNKNOWN_CMD";
+    }
+}
+
+const char* ATModeToString(AT_Mode mode) {
+    switch(mode) {
+        case AT_MODE_INIT: return "INIT";
+        case AT_MODE_CONFIG: return "CONFIG";
+        case AT_MODE_TEST: return "TEST";
+        case AT_MODE_SEND: return "SEND";
+        case AT_MODE_RECONFIG: return "RECONFIG";
+        case AT_MODE_GETTIME: return "GETTIME";
+        default: return "UNKNOWN_MODE";
+    }
+}
+
+const char* ATExpectationToString(AT_Expectation exp) {
+    switch(exp) {
+        case RECEIVE_EXPECTATION_OK: return "OK";
+        case RECEIVE_EXPECTATION_READY: return "READY";
+        case RECEIVE_EXPECTATION_START: return "START";
+        case RECEIVE_EXPECTATION_TIME: return "TIME";
+        default: return "UNKNOWN_EXP";
+    }
 }

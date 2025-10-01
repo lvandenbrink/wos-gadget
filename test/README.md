@@ -5,6 +5,21 @@ Host servers HTTP and MQTT servers with docker
 docker compuse up -d
 ```
 
+### Configure MQTT Password
+
+Create a file named `mqtt_password.txt` and add your desired MQTT username and password in the following format:
+```
+username:password
+```
+
+Run:
+```
+mosquitto_passwd -U mqtt_password.txt
+```
+
+This file will be mounted into the Mosquitto container for authentication.
+
+### 
 Listen to MQTT messages
 ```
 mosquitto_sub -v -h locahost -p 1883 -t '#'

@@ -6,6 +6,7 @@ services:
       - "1883:1883" #default mqtt port
     volumes:
       - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:rw
+      - ./mqtt_password.txt:/mosquitto/config/mqtt_password.txt:r
     restart: no
   wos-test-server:
     image: python:3.12-slim
