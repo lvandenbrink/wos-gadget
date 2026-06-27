@@ -1,16 +1,31 @@
 /*
- * ESP.c
+ * ESP.c - ESP32 AT command driver for WOS Gadget
  *
- *  Created on: Jun 28, 2024
- *      Author: Joris Blankestijn
- *              Bert Havinga nov-dec
+ * === Sequence of operations per measurement cycle ===
+ *
+ * First boot only — ESP_PROGRAM_INIT:
+ *   resetESP() powers on the ESP32 and waits for the "ready" banner.
+ *   AT_INIT runs: disable echo, set RF power, init WiFi driver,
+ *     enable auto-connect (saved to ESP32 flash), set station mode, disable MUX.
+ *   If "WIFI CONNECTED" was seen during init → mode = ESP_PROGRAM_SEND.
+ *   Otherwise                                → mode = ESP_PROGRAM_SET_CONN (explicit CWJAP).
+ *
+ * Every measurement cycle — ESP_PROGRAM_SEND:
+ *   After sensors finish, main.c sets espHandle.startSend = true.
+ *   AT_SEND runs: disable echo, join WiFi (CWJAP handles "already connected"),
+ *     configure MQTT user, connect to broker, publish raw message, send payload,
+ *     disconnect cleanly.
+ *   On success  → done = true.
+ *   On max retries/timeouts → done = true  (main loop sleeps and retries next cycle).
+ *
+ * AP config mode — ESP_PROGRAM_CONFIG_AP (user button held):
+ *   Starts a soft-AP "Omgevingsmonitor_Config" with a web server for WiFi reconfiguration.
  */
-
 
 #include "ESP.h"
 #include <string.h>
 #include <stdio.h>
-#include <EEProm.h>
+#include "EEProm.h"
 #include "Config.h"
 #include "microphone.h"
 #include "PowerUtils.h"
@@ -18,1401 +33,777 @@
 #include "sen5x.h"
 #include "statusCheck.h"
 #include "main.h"
+#include "usart.h"
 #include <stdint.h>
 #include "setLED.h"
+
+// ── UART / DMA ────────────────────────────────────────────────────────────────
 
 static UART_HandleTypeDef *EspUart = NULL;
 extern DMA_HandleTypeDef hdma_usart4_rx;
 
+static uint8_t RxBuffer[ESP_MAX_BUFFER_SIZE];
 static volatile bool RxComplete = false;
 
-static uint8_t RxBuffer[ESP_MAX_BUFFER_SIZE] = {0};
-// static uint8_t LastATResponse[ESP_MAX_BUFFER_SIZE] = {0};
-static const char user[] = "Test";
-static bool testRound = true;
-bool EspTurnedOn = false;
-static bool sendCWJAP = false;
-static bool setTime = true;
+// RX parse state — reset via resetRxState() on every ESP power-cycle so stale
+// DMA positions from the previous cycle don't corrupt the new session.
+static uint16_t rxOldPos  = 0;
+static char     rxLine[128];
+static uint16_t rxLinePos = 0;
+
+// ── Module state ──────────────────────────────────────────────────────────────
+
+bool    EspTurnedOn    = false;
+static bool    setTime        = true;
 static uint32_t uid[3];
-static uint32_t start;
-static uint32_t stop;
-static uint8_t oldEspState = 255;
-float batteryCharge = 0.0;
-float solarCharge = 0.0;
-ESPHandler *ESPHandle = NULL;
-SensorType2 *HTLink = NULL;
-SensorType1 *VOCLink = NULL;
-SensorType1 *DBLink = NULL;
-SensorType3 *SensLink = NULL; 
+static uint32_t txStartTick;         // timestamp when current send sequence began
+static uint8_t  oldEspState   = 255;
+
+// ── Sensor data links (set via initVariableLink) ──────────────────────────────
+
+ESPHandler  *ESPHandle = NULL;
+SensorType2 *HTLink    = NULL;
+SensorType1 *VOCLink   = NULL;
+SensorType1 *DBLink    = NULL;
+SensorType3 *SensLink  = NULL;
+
+float batteryCharge = 0.0f;
+float solarCharge   = 0.0f;
+
+// ── Configuration ─────────────────────────────────────────────────────────────
 
 WifiConfig Credentials;
+
 MqttConfig MqttCredentials = {
-    .broker = "192.168.1.184",
-    .port = 1883,
+    .broker   = "192.168.1.21",
+    .port     = 1883,
     .clientId = "wos-gadget",
-    .topic = "sensors/wos",
-    .username = "client1",
-    .password = "12345"
+    .topic    = "sensor/climate/wos",
+    .username = "wos-client",
+    .password = ""
 };
-static const bool SentHTTPPost = false;
 
-static char message[1152];
-static const char API[] = "\"http://192.168.1.184:9000/test";
+// ── AT command sequences ──────────────────────────────────────────────────────
+
+// First-boot initialisation.
+static AT_Commands AT_INIT[] = {
+    AT_WAKEUP, AT_SET_RFPOWER, AT_CWINIT, AT_CWAUTOCONN, AT_CWMODE1, AT_CIPMUX
+};
+
+// Normal send: join WiFi first, then MQTT publish.
+// AT_CWJAP handles the "already connected" case gracefully.
+static AT_Commands AT_SEND[] = {
+    AT_WAKEUP, AT_CWJAP, AT_MQTTUSERCFG, AT_MQTTCONN, AT_MQTTPUB, AT_SENDDATA, AT_MQTTCLEAN
+};
+
+// Explicit WiFi join (when INIT didn't get a connection).
+static AT_Commands AT_WIFI_CONNECT[] = {
+    AT_WAKEUP, AT_CWINIT, AT_CWMODE3, AT_CWAUTOCONN, AT_CWJAP, AT_CIPMUX
+};
+
+// AP reconfiguration (user-triggered via button).
+static AT_Commands AT_WIFI_CONFIG[] = {
+    AT_WAKEUP, AT_CWMODE3, AT_CWSAP, AT_CIPMUX, AT_WEBSERVER
+};
+
+// NTP time synchronisation.
+static AT_Commands AT_SNTP[] = {
+    AT_WAKEUP, AT_CIPSNTPCFG, AT_CIPSNTPTIME, AT_CIPSNTPINTV
+};
+
+// ── AT state machine variables ────────────────────────────────────────────────
+
+static char        message[1152];
 static AT_Commands ATCommandArray[10];
-static AT_Commands AT_INIT[] = {AT_WAKEUP, AT_SET_RFPOWER, AT_CHECK_RFPOWER, AT_CWINIT, AT_CWAUTOCONN, AT_CWMODE1, AT_CIPMUX};
-static AT_Commands AT_SEND_HTTP[] = {AT_WAKEUP, AT_HTTPCPOST, AT_SENDDATA};
-static AT_Commands AT_SEND_MQTT[] = {AT_WAKEUP, AT_MQTTUSERCFG, AT_MQTTCONN, AT_MQTTPUB, AT_SENDDATA, AT_MQTTCLEAN};
-static AT_Commands AT_LOGIN[] = {AT_WAKEUP, AT_CWSTATE};
-static AT_Commands AT_WIFI_CONFIG[] = {AT_WAKEUP, AT_CWINIT, AT_CWMODE3, AT_CWAUTOCONN, AT_CWJAP, AT_CIPMUX};
-static AT_Commands AT_WIFI_RECONFIG[] = {AT_WAKEUP, AT_CWMODE3, AT_CWSAP, AT_CIPMUX, AT_WEBSERVER};
-static AT_Commands AT_SNTP[] = {AT_WAKEUP, AT_CIPSNTPCFG, AT_CIPSNTPTIME, AT_CIPSNTPINTV}; //RTC, then AT_RTC
-uint8_t ATState;
-uint8_t ATCounter = 0;
-static uint8_t errorcntr = 0;
-//===
+
+uint8_t ATCounter   = 0;
+static uint8_t errorcntr   = 0;
 static uint8_t timeoutcntr = 0;
-//===
-static uint32_t ESPTimeStamp = 0;
+static uint32_t ESPTimeStamp    = 0;
 static uint32_t ESPNTPTimeStamp = 0;
-static uint8_t retry = 0;
-
-typedef struct
-{
-	char *ATCommand;
-	bool *doneFlag;
-} ATCommandsParameters;
-
+static uint8_t  retry           = 0;
 
 static AT_Expectation ATExpectation = RECEIVE_EXPECTATION_OK;
-static AT_Commands ATCommand = AT_WAKEUP;
-static ESP_States EspState = ESP_STATE_INIT;
-static AT_Mode Mode;
-// static ATCommandsParameters ATCommands[ESP_AT_COMMANDS_COUNT];
+static AT_Commands    ATCommand     = AT_WAKEUP;
+static AT_Mode        Mode;
 
-void forceNTPupdate()
-{
-	ESPNTPTimeStamp = 0;
+// ── Public API ────────────────────────────────────────────────────────────────
+
+void forceNTPupdate(void) {
+    ESPNTPTimeStamp = 0;
 }
 
-void initVariableLink(SensorType2* HT, SensorType1* VOC, SensorType1* DB, SensorType3* Sens){
-	HTLink = HT;
-	DBLink = DB;
-	VOCLink = VOC;
-	SensLink = Sens;
+void initVariableLink(SensorType2 *HT, SensorType1 *VOC, SensorType1 *DB, SensorType3 *Sens) {
+    HTLink   = HT;
+    DBLink   = DB;
+    VOCLink  = VOC;
+    SensLink = Sens;
 }
 
-void setCharges()
-{
-	batteryCharge = ReadBatteryVoltage();
-	solarCharge = ReadSolarVoltage();
+void setCharges(void) {
+    batteryCharge = ReadBatteryVoltage();
+    solarCharge   = ReadSolarVoltage();
 }
 
-void getWifiCred(void){
-	ReadUint8ArrayEEprom(SSIDStartAddr, Credentials.SSID, SSIDAddrMaxSize);
-	ReadUint8ArrayEEprom(PasswordStartAddr, Credentials.Password, PasswordAddrMaxSize);
-	Info("The SSID is: %s", Credentials.SSID);
-	Info("The Password is: %s", Credentials.Password);
+void getWifiCred(void) {
+    ReadUint8ArrayEEprom(SSIDStartAddr,     Credentials.SSID,     SSIDAddrMaxSize);
+    ReadUint8ArrayEEprom(PasswordStartAddr, Credentials.Password, PasswordAddrMaxSize);
+    Info("WiFi SSID: %s", Credentials.SSID);
 }
 
-bool PM25Active(){
-	static uint8_t tempConfig[IdSize];
-	static uint32_t configSum = 0;
-	static bool test;
-	ReadUint8ArrayEEprom(PM2ConfigAddr, tempConfig, IdSize);
-	for (uint8_t i = 0; i < IdSize; i++)
-	{
-		configSum += tempConfig[i];
-	}
-	test = !(configSum == 0);
-	return test;
+bool PM25Active(void) {
+    uint8_t  cfg[IdSize];
+    uint32_t sum = 0;
+    ReadUint8ArrayEEprom(PM2ConfigAddr, cfg, IdSize);
+    for (uint8_t i = 0; i < IdSize; i++) sum += cfg[i];
+    return sum != 0;
 }
 
-bool checkName()
-{
-	static uint8_t nameConfig[CustomNameMaxLength];
-	static uint32_t configSum = 0;
-	static bool test;
-	ReadUint8ArrayEEprom(CustomNameConfigAddr, nameConfig, CustomNameMaxLength);
-	for (uint8_t i = 0; i < IdSize; i++)
-	{
-		configSum += nameConfig[i];
-	}
-	test = (configSum != 0);
-	return test;
+void DisableESP(void) {
+    EspTurnedOn = false;
+    HAL_GPIO_WritePin(ESP32_EN_GPIO_Port,        ESP32_EN_Pin,        GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port,      ESP32_BOOT_Pin,      GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(Wireless_PSU_EN_GPIO_Port, Wireless_PSU_EN_Pin, GPIO_PIN_RESET);
 }
 
-void DisableESP()
-{
-	EspTurnedOn = false;
-	HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, GPIO_PIN_RESET);
-	HAL_GPIO_WritePin(Wireless_PSU_EN_GPIO_Port, Wireless_PSU_EN_Pin, GPIO_PIN_RESET);
+void initESPHandler(ESPHandler *ESPHand) {
+    ESPHandle = ESPHand;
+    ESPHandle->state = ESP_STATE_INIT;
+    uid[0] = HAL_GetUIDw0();
+    uid[1] = HAL_GetUIDw1();
+    uid[2] = HAL_GetUIDw2();
 }
 
-void ESP_GetUID()
-{
-	uid[0] = HAL_GetUIDw0();
-	uid[1] = HAL_GetUIDw1();
-	uid[2] = HAL_GetUIDw2();
+void initUart(UART_HandleTypeDef *espUart) {
+    EspUart = espUart;
 }
 
-void initESPHandler(ESPHandler* ESPHand){
-	ESPHandle = ESPHand;
-	ESPHandle->state = ESP_STATE_INIT;
-	ESP_GetUID();
+// ── UART send / receive ───────────────────────────────────────────────────────
+
+static bool ESP_Send(const char *command) {
+    Debug("ESP_Send: %s", command);
+    HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(EspUart, (const uint8_t *)command,
+                                                      strlen(command));
+    if (status != HAL_OK) {
+        Error("HAL_UART_Transmit_DMA failed");
+        return false;
+    }
+    return true;
 }
 
-void initUart(UART_HandleTypeDef* espUart){
-	EspUart = espUart;
-}
-
-static bool ESP_Send(const char *command)
-{
-#ifdef LONGMESSAGES
-	printf("ESP_Send: %s\r\n", command);
-#else
-	Debug("ESP_Send: %s", command);
-#endif
-	uint16_t length = strlen(command);
-	HAL_StatusTypeDef status = HAL_UART_Transmit_DMA(EspUart, (const uint8_t*)command, length);
-	if (status != HAL_OK)
-	{
-		Error("Error in HAL_UART_Transmit_DMA");
-		return false;
-	}
-	return true;
-}
-
-static bool ESP_Receive(uint8_t *reply, uint16_t length)
-{
-	//  HAL_UART_DMAStop(EspUart);
-	RxComplete = false;
-	bool reset = false;
-	HAL_StatusTypeDef status = HAL_UART_Receive_DMA(EspUart, reply, length);
-	if (status != HAL_OK)
-	{
-		Error("Error in HAL_UART_Receive_DMA. errorcode: %d", EspUart->ErrorCode);
-		if (status & HAL_UART_ERROR_PE)
-		{
-			Error("Parity error in UART to ESP module");
-			reset = true;
-		}
-		if (status & HAL_UART_ERROR_NE)
-		{
-			Error("Noise error in UART to ESP module");
-			// Try to recover from noise error
+static bool ESP_Receive(uint8_t *buf, uint16_t len) {
+    RxComplete = false;
+    HAL_StatusTypeDef status = HAL_UART_Receive_DMA(EspUart, buf, len);
+    if (status != HAL_OK) {
+        Error("HAL_UART_Receive_DMA failed, code: %d", EspUart->ErrorCode);
+        if (status & HAL_UART_ERROR_NE) {
+            // Noise error — reinitialise UART
             HAL_UART_AbortReceive(EspUart);
             HAL_Delay(10);
-            // Reinitialize UART
             HAL_UART_DeInit(EspUart);
             HAL_Delay(10);
             MX_USART4_UART_Init();
-            return false;
-		}
-		if (status & HAL_UART_ERROR_FE)
-		{
-			Error("Frame error in UART to ESP module");
-		}
-		if (status & HAL_UART_ERROR_ORE)
-		{
-			Error("Overrun error in UART to ESP module");
-		}
-		if (status & HAL_UART_ERROR_DMA)
-		{
-			Error("DMA transfer error in UART to ESP module");
-		}
-		if (status & HAL_UART_ERROR_RTO)
-		{
-			Error("Receiver Timeout error in UART to ESP module");
-		}
-#if (USE_HAL_UART_REGISTER_CALLBACKS == 1)
-		if (status & HAL_UART_ERROR_INVALID_CALLBACK)
-		{
-			Error("Invalid Callback error in UART to ESP module");
-		}
-#endif
-		if (reset)
-		{
-			// Fire all LEDs to red independent of usertoggle or power status and reboot
-			TIM2->CCR1 = 0;
-			TIM2->CCR3 = 4000;
-			TIM2->CCR4 = 4000;
-			TIM3->CCR1 = 0;
-			TIM3->CCR2 = 4000;
-			TIM3->CCR3 = 4000;
-
-			HAL_GPIO_WritePin(MCU_LED_C_R_GPIO_Port, MCU_LED_C_R_Pin, false);
-			HAL_Delay(2000);
-			HAL_NVIC_SystemReset();
-		}
-		RxComplete = true;
-		return false;
-	}
-	return true;
+        }
+        return false;
+    }
+    return true;
 }
 
-// Callback for reception complete
-// void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-//  if (huart == EspUart) {
-//    RxComplete = true;
-//    Debug("RxComplete");
-//  }
-//}
-
-// Callback for UART error
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-	if (huart == EspUart)
-	{
-		// Handle error
-		// EspState = ESP_STATE_ERROR;
-		if (huart->ErrorCode != 4)
-		{
-			Debug("A callback error has occurred, errorcode %d", huart->ErrorCode);
-		}
-	}
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart == EspUart && huart->ErrorCode != 4) {
+        Debug("UART error, code %d", huart->ErrorCode);
+    }
 }
 
-void uint8ArrayToString(char *destination, uint8_t data[])
-{
-	for (int i = 0; i < 12; i++)
-	{
-		sprintf(&destination[i * 2], "%02x", data[i]);
-	}
+// ── DMA buffer management ─────────────────────────────────────────────────────
+
+void clearDMABuffer(void) {
+    memset(RxBuffer, '\0', ESP_MAX_BUFFER_SIZE);
 }
 
-uint16_t CreateMessage()
-{
-	//  uint16_t messageLength = 0;
-	static char Buffer[25];
-	static uint8_t tempConfig[IdSize];
-	static uint8_t humidConfig[IdSize];
-	static uint8_t soundConfig[IdSize];
-	static uint8_t vocConfig[IdSize];
-	static uint8_t batteryConfig[IdSize];
-	static uint8_t solarConfig[IdSize];
-	static uint8_t noxConfig[IdSize];
-	static uint8_t PM2Config[IdSize];
-	static uint8_t PM10Config[IdSize];
-	static uint8_t nameConfig[CustomNameMaxLength];
-	ReadUint8ArrayEEprom(TempConfigAddr, tempConfig, IdSize);
-	ReadUint8ArrayEEprom(HumidConfigAddr, humidConfig, IdSize);
-	ReadUint8ArrayEEprom(dBaConfigAddr, soundConfig, IdSize);
-	if (soundConfig[0] == 0)
-	{
-	ReadUint8ArrayEEprom(dBAConfigAddr, soundConfig, IdSize);
-	}
-	ReadUint8ArrayEEprom(VocIndexConfigAddr, vocConfig, IdSize);
-	ReadUint8ArrayEEprom(BatVoltConfigAddr, batteryConfig, IdSize);
-	ReadUint8ArrayEEprom(SolVoltConfigAddr, solarConfig, IdSize);
-	ReadUint8ArrayEEprom(NOxIndexConfigAddr, noxConfig, IdSize);
-	ReadUint8ArrayEEprom(PM2ConfigAddr, PM2Config, IdSize);
-	ReadUint8ArrayEEprom(PM10ConfigAddr, PM10Config, IdSize);
-	if (checkName())
-	{
-		ReadUint8ArrayEEprom(CustomNameConfigAddr, nameConfig, CustomNameMaxLength);
-	}
-	else
-	{
-		strncpy((char *)nameConfig, user, 5);
-	}
-	//(char*)nameConfig
-	// get name etc from EEprom
-	Debug("sensorid voor opensensmaps nox: %d", noxConfig);
-	setCharges();
-#ifdef MQTT_DATAGRAM
-	memset(message, '\0', 1152);
-	uint16_t index = 0;
-	sprintf(&message[index], "{");
-	index = strlen(message);
-
-	Debug("The temperature value = %2.2f", HTLink->measurementValue1);
-	sprintf(&message[index], "\"temperature\":%.2f,", HTLink->measurementValue1);
-	index = strlen(message);
-
-	sprintf(&message[index], "\"humidity\":%.1f,", HTLink->measurementValue2);
-	index = strlen(message);
-
-	sprintf(&message[index], "\"sound\":%.2f,", DBLink->measurementValue);
-	index = strlen(message);
-
-	sprintf(&message[index], "\"battery\":%.2f,", batteryCharge);
-	index = strlen(message);
-
-	if(!SensLink->active){
-		Info("Sens5 not active");
-		sprintf(&message[index], "\"voc\":%d,", (uint16_t)VOCLink->measurementValue);
-		index = strlen(message);
-
-		sprintf(&message[index], "\"battery\":%.2f", solarCharge);
-		index = strlen(message);
-	}
-
-	if(SensLink->active){
-		sprintf(&message[index], "\"voc\":%d,", (uint16_t)VOCLink->measurementValue);
-		index = strlen(message);
-
-		sprintf(&message[index], "\"battery\":%.2f", solarCharge);
-		index = strlen(message);
-
-		if(PM25Active()){
-			sprintf(&message[index], "\"PM2.5\":%.2f,", SensLink->measurementValue1/10.0f);
-			index = strlen(message);
-		}
-		else{
-			sprintf(&message[index], "\"PM10\":%.2f,", SensLink->measurementValue2/10.0f);
-			index = strlen(message);
-		}
-
-		sprintf(&message[index], "\"NOx\":%.2f", SensLink->measurementValue4/10.0f);
-		index = strlen(message);
-	}
-	Debug("Length of datagram: %d", index);
-	index = sprintf(&message[index], "}");
-#else
-#ifdef LONGDATAGRAM
-	memset(message, '\0', 1152);
-	uint16_t index = 0;
-	sprintf(&message[index], "[");
-	index = strlen(message);
-
-	uint8ArrayToString(Buffer, tempConfig);
-	Debug("The temperature value = %2.2f", HTLink->measurementValue1);
-	// sprintf(&message[index], "{\"name\":\"temp\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%f, \"unit\":\"C\"},", uid[2], (char *)nameConfig, Buffer, Temperature);
-	sprintf(&message[index], "{\"name\":\"temp\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"C\"},", uid[2], (char *)nameConfig, Buffer, HTLink->measurementValue1);
-	index = strlen(message);
-
-	uint8ArrayToString(Buffer, humidConfig);
-	// sprintf(&message[index], "{\"name\":\"humid\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%f, \"unit\":\"%%\"},", uid[2], (char *)nameConfig, Buffer, Humidity);
-	sprintf(&message[index], "{\"name\":\"humid\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.1f, \"unit\":\"%%\"},", uid[2], (char *)nameConfig, Buffer, HTLink->measurementValue2);
-	index = strlen(message);
-
-	uint8ArrayToString(Buffer, soundConfig);
-	sprintf(&message[index], "{\"name\":\"Sound\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"dB(A)\"},", uid[2], (char *)nameConfig, Buffer, DBLink->measurementValue);
-	index = strlen(message);
-
-	uint8ArrayToString(Buffer, batteryConfig);
-	sprintf(&message[index], "{\"name\":\"battery voltage\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"V\"},", uid[2], (char *)nameConfig, Buffer, batteryCharge);
-	index = strlen(message);
-
-	if(!SensLink->active){
-		Info("Sens5 not active");
-
-		uint8ArrayToString(Buffer, vocConfig);
-		sprintf(&message[index], "{\"name\":\"voc\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%d, \"unit\":\"VOCi\"},", uid[2], (char *)nameConfig, Buffer, (uint16_t)VOCLink->measurementValue);
-		index = strlen(message);
-
-		uint8ArrayToString(Buffer, solarConfig);
-		sprintf(&message[index], "{\"name\":\"solar voltage\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"V\"}", uid[2], (char *)nameConfig, Buffer, solarCharge);
-		index = strlen(message);
-	}
-
-	if(SensLink->active){
-
-		uint8ArrayToString(Buffer, vocConfig);
-		sprintf(&message[index], "{\"name\":\"voc\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%d, \"unit\":\"VOCi\"},", uid[2], (char *)nameConfig, Buffer, SensLink->measurementValue3/10.0f);
-		index = strlen(message);
-
-		uint8ArrayToString(Buffer, solarConfig);
-		sprintf(&message[index], "{\"name\":\"solar voltage\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"V\"},", uid[2], (char *)nameConfig, Buffer, solarCharge);
-		index = strlen(message);
-
-		if(PM25Active()){
-			uint8ArrayToString(Buffer, PM2Config);
-			sprintf(&message[index], "{\"name\":\"PM2.5\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"PPM\"},", uid[2], (char *)nameConfig, Buffer, SensLink->measurementValue1/10.0f);
-			index = strlen(message);
-		}
-		else{
-			uint8ArrayToString(Buffer, PM10Config);
-			sprintf(&message[index], "{\"name\":\"PM10\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"PPM\"},", uid[2], (char *)nameConfig, Buffer, SensLink->measurementValue2/10.0f);
-			index = strlen(message);
-		}
-
-		uint8ArrayToString(Buffer, noxConfig);
-		sprintf(&message[index], "{\"name\":\"NOx\", \"id\": %ld, \"user\": \"%s\", \"sensor\": \"%s\", \"value\":%.2f, \"unit\":\"PPM\"}", uid[2], (char *)nameConfig, Buffer, SensLink->measurementValue4/10.0f);
-		index = strlen(message);
-	}
-#else
-	memset(message, '\0', 255);
-	uint16_t index = 0;
-	sprintf(&message[index], "[");
-	index = strlen(message);
-
-	sprintf(&message[index], "{\"Temperature\":%.2f},", Temperature);
-	index = strlen(message);
-
-	sprintf(&message[index], "{\"Humidity\":%.1f},", Humidity);
-	index = strlen(message);
-
-	sprintf(&message[index], "{\"Sound\":%.2f},", dBA);
-	index = strlen(message);
-
-	sprintf(&message[index], "{\"VOC\":%d},", VOCIndex);
-	index = strlen(message);
-
-	sprintf(&message[index], "{\"BatteryVoltage\":%.2f},", batteryCharge);
-	index = strlen(message);
-
-	sprintf(&message[index], "{\"SolarVoltage\":%.2f}", solarCharge);
-#endif
-	Debug("Length of datagram: %d", index);
-	index = sprintf(&message[index], "]");
-#endif
-	return strlen(message);
+// Reset all RX parse state. Must be called before every ESP power-on so the
+// DMA circular-buffer position is correct for the fresh session.
+void resetRxState(void) {
+    rxOldPos  = 0;
+    rxLinePos = 0;
+    memset(rxLine, 0, sizeof(rxLine));
+    clearDMABuffer();
 }
 
-void resetESP(){
-	HAL_GPIO_WritePin(Wireless_PSU_EN_GPIO_Port, Wireless_PSU_EN_Pin, GPIO_PIN_RESET);
-	HAL_Delay(50);
-	HAL_GPIO_WritePin(Wireless_PSU_EN_GPIO_Port, Wireless_PSU_EN_Pin, GPIO_PIN_SET);
-	HAL_Delay(10);
-	// Reset ESP, so we're sure that we're in the right state.
-	HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_RESET);
-	HAL_Delay(10);
-	HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, 1);
-	HAL_Delay(10);
-	HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_SET);
+Receive_Status DMA_ProcessBuffer(uint8_t expectation) {
+    uint16_t pos = ESP_MAX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart4_rx);
+    if (pos >= ESP_MAX_BUFFER_SIZE) pos = ESP_MAX_BUFFER_SIZE - 1;
+
+    if (pos == rxOldPos) {
+        if (retry > ESP_WIFI_WAIT_RESPONSE_TIME_FACTOR) {
+            retry = 0;
+            return RECEIVE_STATUS_TIMEOUT;
+        }
+        retry++;
+        ESPTimeStamp = HAL_GetTick() + ESP_WIFI_RETRY_TIME;
+        return RECEIVE_STATUS_RETRY;
+    }
+
+    retry = 0;
+
+    // Log received bytes as printable text
+    char logBuf[128];
+    uint16_t logLen = 0;
+    for (uint16_t i = rxOldPos; i != pos; i = (i + 1) % ESP_MAX_BUFFER_SIZE) {
+        char ch = RxBuffer[i];
+        if (ch >= ' ' && logLen < sizeof(logBuf) - 1)
+            logBuf[logLen++] = ch;
+        else if (logLen < sizeof(logBuf) - 3) {
+            logBuf[logLen++] = '\\';
+            logBuf[logLen++] = (ch == '\n') ? 'n' : (ch == '\r') ? 'r' : '?';
+        }
+    }
+    logBuf[logLen] = '\0';
+    Info("ESP rx: '%s'", logBuf);
+
+    // Parse byte-by-byte into lines, check each complete line
+    Receive_Status status = RECEIVE_STATUS_INCOMPLETE;
+    for (uint16_t i = rxOldPos; i != pos; i = (i + 1) % ESP_MAX_BUFFER_SIZE) {
+        char ch = RxBuffer[i];
+        bool eol = (ch == '\n' || ch == '\r');
+
+        if (ch >= ' ' && rxLinePos < sizeof(rxLine) - 1) {
+            rxLine[rxLinePos++] = ch;
+            if (ch == '>') eol = true; // ">" prompt is its own end-of-line
+        }
+
+        if (eol && rxLinePos > 0) {
+            rxLine[rxLinePos] = '\0';
+            rxLinePos = 0;
+            Info("ESP line: '%s'", rxLine);
+
+            switch (expectation) {
+            case RECEIVE_EXPECTATION_OK:
+                if (strstr(rxLine, AT_RESPONSE_OK))           status = RECEIVE_STATUS_OK;
+                break;
+            case RECEIVE_EXPECTATION_READY:
+                if (strstr(rxLine, AT_RESPONSE_READY))        status = RECEIVE_STATUS_READY;
+                break;
+            case RECEIVE_EXPECTATION_START:
+                if (strstr(rxLine, AT_RESPONSE_START))        status = RECEIVE_STATUS_START;
+                break;
+            case RECEIVE_EXPECTATION_TIME:
+                if (strstr(rxLine, AT_RESPONSE_TIME_UPDATED)) status = RECEIVE_STATUS_TIME;
+                break;
+            }
+
+            if (strstr(rxLine, AT_RESPONSE_ERROR) || strstr(rxLine, AT_RESPONSE_FAIL))
+                status = RECEIVE_STATUS_ERROR;
+
+            if (strstr(rxLine, AT_RESPONSE_WIFI))
+                ESPHandle->connectionMade = true;
+
+            if (ATCommand == AT_CIPSNTPTIME) {
+                char *timeReply = strstr(rxLine, AT_RESPONSE_CIPSNTPTIME);
+                if (timeReply) ParseTime(timeReply);
+            }
+        }
+    }
+
+    rxOldPos = pos;
+    return status;
 }
 
-void StartProg()
-{
-	// InitWifiConfig();
-	HAL_Delay(100);
-	HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_RESET);
-	HAL_Delay(100);
-	HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, GPIO_PIN_RESET);
-	HAL_Delay(500);
-	HAL_GPIO_WritePin(ESP32_EN_GPIO_Port, ESP32_EN_Pin, GPIO_PIN_SET);
-	HAL_Delay(500);
-	HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, GPIO_PIN_SET);
-	HAL_Delay(40);
+bool ATCompare(Receive_Status received, AT_Expectation expected) {
+    switch (expected) {
+    case RECEIVE_EXPECTATION_OK:    return received == RECEIVE_STATUS_OK;
+    case RECEIVE_EXPECTATION_READY: return received == RECEIVE_STATUS_READY;
+    case RECEIVE_EXPECTATION_START: return received == RECEIVE_STATUS_START;
+    case RECEIVE_EXPECTATION_TIME:  return received == RECEIVE_STATUS_TIME;
+    default:                        return false;
+    }
 }
 
+// ── MQTT payload builder ──────────────────────────────────────────────────────
 
-// PollAwake, RFPOWER and CheckRFPower necesarry when comming out of sleep mode.
-//bool setCommand()
+uint16_t CreateMessage(void) {
+    setCharges();
 
-bool PollAwake()
-{
-	return ESP_Send("ATE0\r\n");
+    memset(message, 0, sizeof(message));
+    size_t pos = 0;
+    size_t cap = sizeof(message) - 1;  // keep one byte for null terminator
+
+#define APPEND(...) pos += snprintf(message + pos, cap - pos, __VA_ARGS__)
+
+    APPEND("{");
+    APPEND("\"temperature\":%.2f,", HTLink->measurementValue1);
+    APPEND("\"humidity\":%.1f,",    HTLink->measurementValue2);
+    APPEND("\"sound\":%.2f,",       DBLink->measurementValue);
+    APPEND("\"battery\":%.2f,",     batteryCharge);
+    APPEND("\"solar\":%.2f,",       solarCharge);
+    APPEND("\"voc\":%d",            (uint16_t)VOCLink->measurementValue);
+
+    if (SensLink->active) {
+        if (PM25Active())
+            APPEND(",\"PM2.5\":%.2f", SensLink->measurementValue1 / 10.0f);
+        else
+            APPEND(",\"PM10\":%.2f",  SensLink->measurementValue2 / 10.0f);
+        APPEND(",\"NOx\":%.2f", SensLink->measurementValue4 / 10.0f);
+    }
+
+    APPEND("}");
+#undef APPEND
+
+    Info("MQTT payload (%u bytes): %s", (uint16_t)pos, message);
+    return (uint16_t)pos;
 }
 
-bool RFPower()
-{
-	return ESP_Send("AT+RFPOWER=70\r\n");
+// ── ESP32 hardware control ────────────────────────────────────────────────────
+
+void resetESP(void) {
+    // Power-cycle the wireless PSU, then toggle EN to boot the ESP32.
+    HAL_GPIO_WritePin(Wireless_PSU_EN_GPIO_Port, Wireless_PSU_EN_Pin, GPIO_PIN_RESET);
+    HAL_Delay(50);
+    HAL_GPIO_WritePin(Wireless_PSU_EN_GPIO_Port, Wireless_PSU_EN_Pin, GPIO_PIN_SET);
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(ESP32_EN_GPIO_Port,   ESP32_EN_Pin,   GPIO_PIN_RESET);
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, 1);
+    HAL_Delay(10);
+    HAL_GPIO_WritePin(ESP32_EN_GPIO_Port,   ESP32_EN_Pin,   GPIO_PIN_SET);
 }
 
-bool CheckRFPower()
-{
-	return ESP_Send("AT+RFPOWER?\r\n");
+// Used when BOOT0 is held at startup to enter ESP32 programming mode.
+void StartProg(void) {
+    HAL_Delay(100);
+    HAL_GPIO_WritePin(ESP32_EN_GPIO_Port,   ESP32_EN_Pin,   GPIO_PIN_RESET);
+    HAL_Delay(100);
+    HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, GPIO_PIN_RESET);
+    HAL_Delay(500);
+    HAL_GPIO_WritePin(ESP32_EN_GPIO_Port,   ESP32_EN_Pin,   GPIO_PIN_SET);
+    HAL_Delay(500);
+    HAL_GPIO_WritePin(ESP32_BOOT_GPIO_Port, ESP32_BOOT_Pin, GPIO_PIN_SET);
+    HAL_Delay(40);
 }
 
-// Only necesarry on first init
-bool ATRestore()
-{
-	return ESP_Send("AT+RESTORE\r\n");
+// ── AT command helpers ────────────────────────────────────────────────────────
+
+static bool PollAwake(void)   { return ESP_Send("ATE0\r\n"); }
+static bool RFPower(void)     { return ESP_Send("AT+RFPOWER=70\r\n"); }
+static bool ATRestore(void)   { return ESP_Send("AT+RESTORE\r\n"); }
+static bool CWINIT(void)      { return ESP_Send("AT+CWINIT=1\r\n"); }
+static bool CWMODE1(void)     { return ESP_Send("AT+CWMODE=1\r\n"); }
+static bool CWMODE2(void)     { return ESP_Send("AT+CWMODE=2\r\n"); }
+static bool CWMODE3(void)     { return ESP_Send("AT+CWMODE=3\r\n"); }
+static bool CWAUTOCONN(void)  { return ESP_Send("AT+CWAUTOCONN=1\r\n"); }
+static bool CWSTATE(void)     { return ESP_Send("AT+CWSTATE?\r\n"); }
+static bool CWSAP(void)       { return ESP_Send("AT+CWSAP=\"Omgevingsmonitor_Config\",\"\",11,0,1\r\n"); }
+static bool CIPMUX(void)      { return ESP_Send("AT+CIPMUX=0\r\n"); }
+static bool WEBSERVER(void)   { return ESP_Send("AT+WEBSERVER=1,80,60\r\n"); }
+
+#define AT_CMD_BUF_LEN 150
+static char atCmdBuf[AT_CMD_BUF_LEN];
+
+static bool CWJAP(void) {
+    getWifiCred();
+    if (Credentials.SSID[0] == 0) {
+        // No credentials stored — send a no-op (ATE0) so the state machine
+        // gets an OK and advances to the next step normally.
+        Info("No WiFi credentials configured");
+        return ESP_Send("ATE0\r\n");
+    }
+    snprintf(atCmdBuf, sizeof(atCmdBuf), "AT+CWJAP=\"%s\",\"%s\"\r\n",
+             Credentials.SSID, Credentials.Password);
+    return ESP_Send(atCmdBuf);
 }
 
-bool CWINIT()
-{
-	return ESP_Send("AT+CWINIT=1\r\n");
+static bool SENDDATA(void) { return ESP_Send(message); }
+
+static bool MQTTUSERCFG(void) {
+    snprintf(atCmdBuf, sizeof(atCmdBuf),
+             "AT+MQTTUSERCFG=0,1,\"%s\",\"%s\",\"%s\",0,0,\"\"\r\n",
+             MqttCredentials.clientId, MqttCredentials.username, MqttCredentials.password);
+    return ESP_Send(atCmdBuf);
 }
 
-bool CWMODE1()
-{
-	return ESP_Send("AT+CWMODE=1\r\n");
+static bool MQTTCONN(void) {
+    snprintf(atCmdBuf, sizeof(atCmdBuf),
+             "AT+MQTTCONN=0,\"%s\",%d,0\r\n",
+             MqttCredentials.broker, MqttCredentials.port);
+    return ESP_Send(atCmdBuf);
 }
 
-bool CWMODE2()
-{
-	return ESP_Send("AT+CWMODE=2\r\n");
+static bool MQTTPUB(void) {
+    uint16_t len = CreateMessage();
+    Info("Publishing to '%s' (%u bytes, retain=1)", MqttCredentials.topic, len);
+    snprintf(atCmdBuf, sizeof(atCmdBuf),
+             "AT+MQTTPUBRAW=0,\"%s\",%u,0,1\r\n", MqttCredentials.topic, len);
+    return ESP_Send(atCmdBuf);
 }
 
-bool CWAUTOCONN()
-{
-	return ESP_Send("AT+CWAUTOCONN=1\r\n");
+static bool MQTTCLEAN(void) { return ESP_Send("AT+MQTTCLEAN=0\r\n"); }
+
+static bool CIPSNTPCFG(void) {
+    bool ok = ESP_Send("AT+CIPSNTPCFG=1,100,\"nl.pool.ntp.org\",\"time.google.com\",\"time.windows.com\"\r\n");
+    if (ok) HAL_Delay(1000);
+    return ok;
 }
 
+static bool CIPSNTPTIME(void) { return ESP_Send("AT+CIPSNTPTIME?\r\n"); }
+static bool CIPSNTPINTV(void) { return ESP_Send("AT+CIPSNTPINTV=14400\r\n"); }
 
-#define AT_COMMAND_BUFF_LEN 150
-static char atCommandBuff[AT_COMMAND_BUFF_LEN];
+// ── AT_Send dispatcher ────────────────────────────────────────────────────────
 
-void appendEscapedString(const char *str)
-{
-	size_t pos = strlen(atCommandBuff);
-	for (; *str != '\0' && pos < AT_COMMAND_BUFF_LEN - 8; str++)
-	{
-		if (*str == ',' || *str == '\\' || *str == '"')
-		{
-			atCommandBuff[pos++] = '\\';
-		}
-		atCommandBuff[pos++] = *str;
-	}
-	atCommandBuff[pos] = '\0';
+bool AT_Send(AT_Commands cmd) {
+    bool sent = false;
+    switch (cmd) {
+    case AT_WAKEUP:
+        if (TimestampIsReached(ESPTimeStamp)) {
+            sent = PollAwake();
+            ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        }
+        break;
+    case AT_SET_RFPOWER:
+        sent = RFPower();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_RESTORE:
+        sent = ATRestore();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
+        break;
+    case AT_CWINIT:
+        sent = CWINIT();
+        ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        break;
+    case AT_CWSTATE:
+        sent = CWSTATE();
+        ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        break;
+    case AT_CWMODE1:
+        sent = CWMODE1();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_CWMODE2:
+        sent = CWMODE2();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_CWAUTOCONN:
+        sent = CWAUTOCONN();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_CWJAP:
+        sent = CWJAP();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
+        break;
+    case AT_CWMODE3:
+        sent = CWMODE3();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_CWSAP:
+        sent = CWSAP();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_CIPMUX:
+        sent = CIPMUX();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_WEBSERVER:
+        sent = WEBSERVER();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_MQTTUSERCFG:
+        sent = MQTTUSERCFG();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
+        break;
+    case AT_MQTTCONN:
+        if (ESPHandle->startSend) {
+            sent = MQTTCONN();
+            ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        }
+        break;
+    case AT_MQTTPUB:
+        sent = MQTTPUB();
+        ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        break;
+    case AT_MQTTCLEAN:
+        sent = MQTTCLEAN();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
+        break;
+    case AT_SENDDATA:
+        sent = SENDDATA();
+        ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        break;
+    case AT_CIPSNTPCFG:
+        sent = CIPSNTPCFG();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_CIPSNTPTIME:
+        sent = CIPSNTPTIME();
+        ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
+        break;
+    case AT_CIPSNTPINTV:
+        sent = CIPSNTPINTV();
+        ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
+        break;
+    case AT_END:
+        break;
+    }
+    return sent;
 }
 
-bool CWJAP()
-{
-	getWifiCred();
-	if (Credentials.SSID[0] == 0 || Credentials.Password[0] == 0)
-	{
-		Info("No SSID or Password configured, use WiFi credentials configured via ESP AP");
-		return true;
-	}
+// ── ESP upkeep state machine ──────────────────────────────────────────────────
 
-	sendCWJAP = true;
-	static char atCommandBuff[100];
-	memset(atCommandBuff, '\0', 100);
-	sprintf(atCommandBuff, "AT+CWJAP=\"%s\",\"%s\"\r\n", Credentials.SSID, Credentials.Password);
-	uint8_t len = strlen(atCommandBuff);
-	char atCommand[len + 1];
-	memset(atCommand, '\0', len + 1);
-	strncpy(atCommand, atCommandBuff, len);
-	// SetCommandBuffer(atCommand);
-	return ESP_Send(atCommandBuff);
-}
+ESP_States ESP_Upkeep(void) {
+    static Receive_Status ATReceived = RECEIVE_STATUS_INCOMPLETE;
 
-bool CWMODE3()
-{
-	return ESP_Send("AT+CWMODE=3\r\n");
-}
+    if (ESPHandle->state != oldEspState && GetVerboseLevel() == VERBOSE_ALL) {
+        oldEspState = ESPHandle->state;
+        Debug("ESP state=%-14s cmd=%-14s mode=%-10s exp=%s",
+              ESPStateToString(ESPHandle->state), ATCommandToString(ATCommand),
+              ATModeToString(Mode), ATExpectationToString(ATExpectation));
+    }
 
-bool CWSTATE()
-{
-	return ESP_Send("AT+CWSTATE?\r\n");
-}
+    switch (ESPHandle->state) {
 
-bool CWSAP()
-{
-	return ESP_Send("AT+CWSAP=\"Omgevingsmonitor_Config\",\"\",11,0,1\r\n");
-}
+    // ── IDLE: wait for a trigger ──────────────────────────────────────────────
+    case ESP_STATE_IDLE:
+        if (ESPHandle->configAP) {
+            ESPHandle->state = ESP_STATE_CONFIG;
+        } else if (!ESPHandle->done) {
+            ESPHandle->state = ESP_STATE_INIT;
+            EspTurnedOn = false;
+        }
+        break;
 
-bool CIPMUX()
-{
-	return ESP_Send("AT+CIPMUX=0\r\n");
-}
+    // ── INIT: power on ESP32 and start listening ──────────────────────────────
+    case ESP_STATE_INIT:
+        if (!EspTurnedOn) {
+            resetRxState();  // clear stale DMA position from previous cycle
+            resetESP();
+            ESPTimeStamp = HAL_GetTick() + ESP_START_UP_TIME;
+            EspTurnedOn  = true;
+            ESPHandle->ready = true;
+        }
+        if (ESP_Receive(RxBuffer, ESP_MAX_BUFFER_SIZE))
+            ESPHandle->state = ESP_STATE_WAIT_AWAKE;
+        break;
 
-// This command sets the webserver, only necessary for first initialization.
-bool WEBSERVER()
-{
-	return ESP_Send("AT+WEBSERVER=1,80,60\r\n");
-}
+    // ── WAIT_AWAKE: wait for the "ready" boot banner ──────────────────────────
+    case ESP_STATE_WAIT_AWAKE:
+        ATReceived = DMA_ProcessBuffer(RECEIVE_EXPECTATION_READY);
+        if (ATCompare(ATReceived, RECEIVE_EXPECTATION_READY))
+            ESPHandle->state = ESP_STATE_MODE_SELECT;
+        break;
 
-// These are the commands necesarry for sending data.
-bool HTTPCPOST()
-{
-	uint16_t length = CreateMessage();
-	static uint8_t boxConfig[IdSize];
-	static char Buffer[25];
-	ReadUint8ArrayEEprom(BoxConfigAddr, boxConfig, IdSize);
-	uint8ArrayToString(Buffer, boxConfig);
-	sprintf(atCommandBuff, "AT+HTTPCPOST=%s%s/data\",%d,1,\"content-type: application/json\"\r\n", API, Buffer, length);
-	return ESP_Send(atCommandBuff); // && ReadyToSendMeasurement) //Gaat niet door de retry waar door die altijd fout gaat
-}
+    // ── MODE_SELECT: load the command sequence for the current program ────────
+    case ESP_STATE_MODE_SELECT:
+        memset(ATCommandArray, AT_END, sizeof(ATCommandArray));
+        ATCounter     = 0;
+        ATExpectation = RECEIVE_EXPECTATION_OK;
 
-bool SENDDATA()
-{
-	return ESP_Send(message);
-}
+        switch (ESPHandle->mode) {
+        case ESP_PROGRAM_INIT:
+            memcpy(ATCommandArray, AT_INIT,         sizeof(AT_INIT));
+            Mode = AT_MODE_INIT;
+            break;
+        case ESP_PROGRAM_SET_CONN:
+            memcpy(ATCommandArray, AT_WIFI_CONNECT, sizeof(AT_WIFI_CONNECT));
+            Mode = AT_MODE_CONFIG;
+            break;
+        case ESP_PROGRAM_SEND:
+            memcpy(ATCommandArray, AT_SEND,         sizeof(AT_SEND));
+            Mode = AT_MODE_SEND;
+            txStartTick = HAL_GetTick();
+            break;
+        case ESP_PROGRAM_CONFIG_AP:
+            memcpy(ATCommandArray, AT_WIFI_CONFIG,  sizeof(AT_WIFI_CONFIG));
+            Mode = AT_MODE_RECONFIG;
+            break;
+        case ESP_PROGRAM_RTC:
+            memcpy(ATCommandArray, AT_SNTP,         sizeof(AT_SNTP));
+            Mode = AT_MODE_GETTIME;
+            txStartTick = HAL_GetTick();
+            break;
+        default:
+            Error("Unknown ESP program mode %d", ESPHandle->mode);
+            ESPHandle->state = ESP_STATE_DEINIT;
+            return ESPHandle->state;
+        }
 
-// MQTT configuration and connection functions
-bool MQTTUSERCFG()
-{
-	// Set MQTT User Configuration.
-	// AT+MQTTUSERCFG=<LinkID>,<scheme>,<"client_id">,<"username">,<"password">,<cert_key_ID>,<CA_ID>,<"path">
-	sprintf(atCommandBuff, "AT+MQTTUSERCFG=0,1,\"%s\",\"%s\",\"%s\",0,0,\"\"\r\n", 
-		MqttCredentials.clientId, MqttCredentials.username, MqttCredentials.password);
-	return ESP_Send(atCommandBuff);
-}
+        ATCommand = ATCommandArray[ATCounter];
+        ESPHandle->state = ESP_STATE_SEND;
+        break;
 
-bool MQTTCONN()
-{
-	// Connect to MQTT broker
-	// AT+MQTTCONN=<LinkID>,<"host">,<port>,<reconnect>
-	// reconnect: 0=no auto reconnect, 1=auto reconnect (uses more resources)
-	sprintf(atCommandBuff, "AT+MQTTCONN=0,\"%s\",%d,0\r\n", MqttCredentials.broker, MqttCredentials.port);
-	return ESP_Send(atCommandBuff);
-}
+    // ── SEND: dispatch the current AT command ─────────────────────────────────
+    case ESP_STATE_SEND:
+        if (AT_Send(ATCommand))
+            ESPHandle->state = ESP_STATE_WAIT_FOR_REPLY;
+        break;
 
-bool MQTTPUB()
-{
-	// Create the message content
-	uint16_t length = CreateMessage();
-	// Debug output to verify message content and length
-	Debug("MQTT Message (%u bytes): %s", length, message);
-	
-	// Publish MQTT message to a topic.
-	// AT+MQTTPUBRAW=<LinkID>,<"topic">,<length>,<qos>,<retain>
-	sprintf(atCommandBuff, "AT+MQTTPUBRAW=0,\"%s\",%u,0,0\r\n", MqttCredentials.topic, length);
-	return ESP_Send(atCommandBuff);
-}
+    // ── WAIT_FOR_REPLY: parse the response ───────────────────────────────────
+    case ESP_STATE_WAIT_FOR_REPLY:
+        if (!TimestampIsReached(ESPTimeStamp)) break;
 
-bool MQTTCLEAN()
-{
-	// Clean disconnect from MQTT broker
-	return ESP_Send("AT+MQTTCLEAN=0\r\n");
-}
+        ATReceived = DMA_ProcessBuffer(ATExpectation);
 
-bool CIPSNTPCFG()
-{
-	if (ESP_Send("AT+CIPSNTPCFG=1,100,\"nl.pool.ntp.org\",\"time.google.com\",\"time.windows.com\"\r\n"))
-	{
-		HAL_Delay(1000);
-		return true;
-	}
-	else
-	{
-		return false;
-	}
-}
+        if (ATReceived == RECEIVE_STATUS_INCOMPLETE) {
+            // Still receiving — check again after a short delay
+            ESPTimeStamp = HAL_GetTick() + 10;
+        } else if (ATReceived == RECEIVE_STATUS_ERROR) {
+            if (ATCommand == AT_CWJAP) ErrorBlinkWiFi();
+            errorcntr++;
+            if (errorcntr >= ESP_MAX_RETRANSMITIONS) {
+                clearDMABuffer();
+                Error("Max retransmits, aborting after %lu ms", HAL_GetTick() - txStartTick);
+                errorcntr = 0;
+                ESPHandle->state = ESP_STATE_DEINIT;
+            } else {
+                ESPHandle->state = ESP_STATE_SEND;
+            }
+        } else if (ATReceived == RECEIVE_STATUS_TIMEOUT) {
+            timeoutcntr++;
+            Error("AT timeout (cmd=%s)", ATCommandToString(ATCommand));
+            if (timeoutcntr >= ESP_MAX_RETRANSMITIONS) {
+                clearDMABuffer();
+                Error("Max timeouts, aborting after %lu ms", HAL_GetTick() - txStartTick);
+                timeoutcntr = 0;
+                ESPHandle->state = ESP_STATE_DEINIT;
+            } else {
+                ESPHandle->state = ESP_STATE_SEND;
+            }
+        } else if (ATCompare(ATReceived, ATExpectation)) {
+            ESPHandle->state = ESP_STATE_NEXT_AT;
+        }
+        break;
 
-bool CIPSNTPTIME()
-{
-	return ESP_Send("AT+CIPSNTPTIME?\r\n");
-}
+    // ── NEXT_AT: advance to the next command in the sequence ─────────────────
+    case ESP_STATE_NEXT_AT:
+        ATCounter++;
+        ATCommand   = ATCommandArray[ATCounter];
+        errorcntr   = 0;
+        timeoutcntr = 0;
 
-bool CIPSNTPINTV()
-{
-	return ESP_Send("AT+CIPSNTPINTV=14400\r\n");
-}
+        // Pick the right expectation for the incoming command
+        if      (ATCommand == AT_RESTORE)     ATExpectation = RECEIVE_EXPECTATION_READY;
+        else if (ATCommand == AT_MQTTPUB)     ATExpectation = RECEIVE_EXPECTATION_START;
+        else if (ATCommand == AT_CIPSNTPCFG)  ATExpectation = RECEIVE_EXPECTATION_TIME;
+        else                                  ATExpectation = RECEIVE_EXPECTATION_OK;
 
-#define RECEIVE_BUFFER_LEN 128
+        if (ATCommand != AT_END) {
+            ESPHandle->state = ESP_STATE_SEND;
+            break;
+        }
 
-Receive_Status DMA_ProcessBuffer(uint8_t expectation)
-{
-	uint16_t pos = ESP_MAX_BUFFER_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart4_rx);
-	static volatile uint8_t OldPos = 0;
-	Receive_Status status = RECEIVE_STATUS_INCOMPLETE;
-	if (pos > ESP_MAX_BUFFER_SIZE - 1)
-	{
-		pos = ESP_MAX_BUFFER_SIZE - 1;
-	}
+        // ── Sequence complete ─────────────────────────────────────────────────
+        if (ESPHandle->mode == ESP_PROGRAM_INIT ||
+            ESPHandle->mode == ESP_PROGRAM_SET_CONN) {
+            if (!ESPHandle->connectionMade) {
+                ErrorBlinkWiFi();
+                if (ESPHandle->mode == ESP_PROGRAM_SET_CONN) ESPHandle->done = true;
+                ESPHandle->mode = ESP_PROGRAM_SET_CONN;
+            } else {
+                ESPHandle->mode = ESP_PROGRAM_SEND;
+            }
+            ESPHandle->state = ESP_STATE_IDLE;
 
-	if (pos == OldPos)
-	{
-		if (retry > ESP_WIFI_WAIT_RESPONSE_TIME_FACTOR)
-		{
-			retry = 0;
-			// EspState = ESP_STATE_SEND;
-			if (ATCommand == AT_WAKEUP && testRound == true)
-			{
-				status = RECEIVE_STATUS_UNPROGGED;
-			}
-			if (ATCommand == AT_CWJAP)
-			{
-				EspState = ESP_STATE_MODE_SELECT;
-			}
-			else
-			{
-				status = RECEIVE_STATUS_TIMEOUT;
-			}
-		}
-		else
-		{
-			retry++;
-			ESPTimeStamp = HAL_GetTick() + ESP_WIFI_RETRY_TIME;
-			status = RECEIVE_STATUS_RETRY;
-		}
-		return status;
-	}
+        } else if (ESPHandle->mode == ESP_PROGRAM_SEND) {
+            clearDMABuffer();
+            Info("MQTT publish done in %lu ms", HAL_GetTick() - txStartTick);
+            ResetdBAmax();
+            showTime();
+            ESPHandle->done  = true;
+            ESPHandle->state = ESP_STATE_IDLE;
 
-	// Received some data
-	retry = 0;
+        } else if (ESPHandle->mode == ESP_PROGRAM_RTC) {
+            setTime = false;
+            ESPNTPTimeStamp = HAL_GetTick() + ESP_UNTIL_NEXT_NTP;
+            Info("NTP synced. Next sync in ~24 h (tick %lu)", ESPNTPTimeStamp);
+            clearDMABuffer();
+            ESPHandle->mode  = ESP_PROGRAM_SEND;
+            ESPHandle->state = ESP_STATE_IDLE;
 
-	// Fill tempBuf with data for printing
-	uint16_t j = 0;
-	char tempBuf[RECEIVE_BUFFER_LEN];
-	for (uint16_t i = OldPos; i != pos; i = (i + 1) % ESP_MAX_BUFFER_SIZE) {
-		char ch = RxBuffer[i];
-		if (ch >= ' ') {
-			if (j < RECEIVE_BUFFER_LEN - 1) {
-				tempBuf[j++] = ch;
-			}
-		}
-		else {
-			if (j < RECEIVE_BUFFER_LEN - 1) {
-				tempBuf[j++] = '\\';
-				}
-			char esc = '?';
-			switch (ch) {
-				case '\n': esc = 'n'; break;
-				case '\r': esc = 'r'; break;
-				case '\t': esc = 't'; break;
-				case '\b': esc = 'b'; break;
-					}
-			if (j < RECEIVE_BUFFER_LEN - 1) {
-				tempBuf[j++] = esc;
-			}
-		}
-	}
-	tempBuf[j] = '\0';
-#ifdef LONGMESSAGES
-	printf("Receive DMA_ProcessBuffer: '%s'", tempBuf);
-#else
-	Info("Receive DMA_ProcessBuffer: '%s'", tempBuf);
-#endif
+        } else {
+            ESPHandle->state = ESP_STATE_IDLE;
+        }
+        break;
 
-	// Segment the receive data into command terminated with newline or '>'
-	static char receiveBuffer[RECEIVE_BUFFER_LEN];
-	static uint16_t receiveBufferPos = 0;
-	for (uint16_t i = OldPos; i != pos; i = (i + 1) % ESP_MAX_BUFFER_SIZE) {
-		char ch = RxBuffer[i];
-		bool end_of_reply = true;
-		if (ch >= ' ' && receiveBufferPos < RECEIVE_BUFFER_LEN - 1) {
-			if (receiveBufferPos < RECEIVE_BUFFER_LEN - 1) {
-				receiveBuffer[receiveBufferPos++] = ch;
-			}
-			end_of_reply = ch == '>';
-		}
-		if (end_of_reply && receiveBufferPos > 0) {
-			receiveBuffer[receiveBufferPos] = '\0';
-			receiveBufferPos = 0;
-#ifdef LONGMESSAGES
-			printf("Receive command: '%s'", receiveBuffer);
-#else
-			Info("Receive command: '%s'", receiveBuffer);
-#endif
+    // ── DEINIT: sequence failed — let the main loop proceed to sleep ──────────
+    case ESP_STATE_DEINIT:
+        ESPHandle->done  = true;
+        ESPHandle->state = ESP_STATE_IDLE;
+        break;
 
-			// Process a command
-			switch (expectation) {
-			case RECEIVE_EXPECTATION_OK:
-				if (strstr(receiveBuffer, AT_RESPONSE_OK) != 0) {
-					status = RECEIVE_STATUS_OK;
-				}
-				break;
-			case RECEIVE_EXPECTATION_READY:
-				if (strstr(receiveBuffer, AT_RESPONSE_READY) != 0) {
-					status = RECEIVE_STATUS_READY;
-				}
-				break;
-			case RECEIVE_EXPECTATION_START:
-				if (strstr(receiveBuffer, AT_RESPONSE_START) != 0) {
-					status = RECEIVE_STATUS_START;
-				}
-				break;
-			case RECEIVE_EXPECTATION_TIME:
-				if (strstr(receiveBuffer, AT_RESPONSE_TIME_UPDATED) != 0) {
-					status = RECEIVE_STATUS_TIME;
-				}
-				break;
-			}
-			if (strstr(receiveBuffer, AT_RESPONSE_ERROR) != 0 || strstr(receiveBuffer, AT_RESPONSE_FAIL) != 0) {
-				status = RECEIVE_STATUS_ERROR;
-			}
-			else if (strstr(receiveBuffer, AT_RESPONSE_WIFI) != 0) {
-				ESPHandle->connectionMade = true;
-
-			}
-			else if (ATCommand == AT_CIPSNTPTIME) {
-				char *timeReply = strstr(receiveBuffer, AT_RESPONSE_CIPSNTPTIME);
-				if (timeReply != NULL) {
-					ParseTime(timeReply);
-				}
-			}
-		}
-	}
-
-	OldPos = pos;
-
-	return status;
-}
-
-void clearDMABuffer()
-{
-	memset(RxBuffer, '\0', ESP_MAX_BUFFER_SIZE);
-}
-
-// Compares the received status to the expected status (OK, ready, >).
-bool ATCompare(Receive_Status AT_Command_Received, AT_Expectation AT_Command_Expected)
-{
-	bool value = false;
-	if (AT_Command_Expected == RECEIVE_EXPECTATION_OK)
-	{
-		value = (AT_Command_Received == RECEIVE_STATUS_OK);
-	}
-	if (AT_Command_Expected == RECEIVE_EXPECTATION_READY)
-	{
-		value = (AT_Command_Received == RECEIVE_STATUS_READY);
-	}
-	if (AT_Command_Expected == RECEIVE_EXPECTATION_START)
-	{
-		value = (AT_Command_Received == RECEIVE_STATUS_START);
-	}
-	if (AT_Command_Expected == RECEIVE_EXPECTATION_TIME)
-	{
-		value = (AT_Command_Received == RECEIVE_STATUS_TIME);
-	}
-	return (value);
-}
-
-bool AT_Send(AT_Commands state)
-{
-	bool ATCommandSend = false;
-	switch (state)
-	{
-
-	case AT_WAKEUP:
-		if (TimestampIsReached(ESPTimeStamp))
-		{
-			ATCommandSend = PollAwake();
-			ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME; //ESP_RESPONSE_LONG;
-		}
-		break;
-///////////////////////////////////////////////////////////////////////////////////////////////////	
-	// case AT_ECHO:
-	// 	if (TimestampIsReached(ESPTimeStamp))
-	// 	{
-	// 		ATCommandSend = EnableEcho();
-	// 		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME; //ESP_RESPONSE_LONG;
-	// 	}
-	// 	break;
-	// case AT_SYSLOG:
-	// 	if (TimestampIsReached(ESPTimeStamp))
-	// 	{
-	// 		ATCommandSend = EnableSysLOG();
-	// 		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME; //ESP_RESPONSE_LONG;
-	// 	}
-	// 	break;
-///////////////////////////////////////////////////////////////////////////////////////////////////
-	case AT_SET_RFPOWER:
-		Debug("Setting RF Power");
-		ATCommandSend = RFPower();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CHECK_RFPOWER:
-		Debug("Checking RF Power");
-		ATCommandSend = CheckRFPower();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_RESTORE:
-		Debug("Restoring ESP");
-		ATCommandSend = ATRestore();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
-		break;
-
-	case AT_CWINIT:
-		Debug("Initializing Wi-Fi");
-		ATCommandSend = CWINIT();
-		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
-		break;
-
-	case AT_CWSTATE:
-		Debug("Checking current SSID");
-		ATCommandSend = CWSTATE();
-		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
-		break;
-
-	case AT_CWMODE1:
-		Debug("Setting to station mode");
-		ATCommandSend = CWMODE1();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CWMODE2:
-		Debug("Setting to station mode");
-		ATCommandSend = CWMODE2();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CWAUTOCONN:
-		Debug("Setting auto connect");
-		ATCommandSend = CWAUTOCONN();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CWJAP:
-		Debug("Connect to Wi-Fi");
-		ATCommandSend = CWJAP();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
-		break;
-
-	case AT_CWMODE3:
-		Debug("SET in station/soft-ap mode");
-		ATCommandSend = CWMODE3();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CWSAP:
-		Debug("SET soft AP mode parameters");
-		ATCommandSend = CWSAP();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CIPMUX:
-		ATCommandSend = CIPMUX();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_WEBSERVER:
-		ATCommandSend = WEBSERVER();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_HTTPCPOST:
-		if (ESPHandle->startSend) //TimestampIsReached(HTTPCPostTimestamp)
-		{
-			ATCommandSend = HTTPCPOST();
-			ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
-		}
-		else 
-		{
-			return false;
-		}
-		break;
-	case AT_MQTTUSERCFG:
-		Debug("Configure MQTT user settings");
-		ATCommandSend = MQTTUSERCFG();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
-		break;
-
-	case AT_MQTTCONN:
-		if (ESPHandle->startSend) {
-			Debug("Connect to MQTT broker");
-			ATCommandSend = MQTTCONN();
-			ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
-		} else {
-			return false;
-		}
-		break;
-
-	case AT_MQTTPUB:
-		Debug("Publish MQTT message");
-		ATCommandSend = MQTTPUB();
-		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
-		break;
-
-	case AT_MQTTCLEAN:
-		Debug("Clean disconnect from MQTT");
-		ATCommandSend = MQTTCLEAN();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_LONG;
-		break;
-
-	case AT_SENDDATA:
-		Debug("Send the data");
-		ATCommandSend = SENDDATA();
-		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME; // + 7000;
-		break;
-
-	case AT_CIPSNTPCFG:
-		Debug("Config SNTP client");
-		ATCommandSend = CIPSNTPCFG();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-
-	case AT_CIPSNTPTIME:
-		Debug("Get time from internet");
-		ATCommandSend = CIPSNTPTIME();
-		ESPTimeStamp = HAL_GetTick() + ESP_WIFI_INIT_TIME;
-		break;
-	case AT_CIPSNTPINTV:
-		Debug("Set the interval to timesync");
-		ATCommandSend = CIPSNTPINTV();
-		ESPTimeStamp = HAL_GetTick() + ESP_RESPONSE_TIME;
-		break;
-	case AT_END:
-		break;
-	}
-
-	return (ATCommandSend);
-}
-
-ESP_States ESP_Upkeep(void)
-{
-	static uint32_t timeoutTimer = 0;
-	static Receive_Status ATReceived = RECEIVE_STATUS_INCOMPLETE;
-
-	if ((ESPHandle->state != oldEspState) && (GetVerboseLevel() == VERBOSE_ALL))
-	{
-		oldEspState = ESPHandle->state;
-		if (!((oldEspState == 3) && (ATCommand == AT_HTTPCPOST || ATCommand == AT_MQTTPUB)))
-		{
-			// Debug("EspState: %d ATcmd: %d Mode: %d ATExp: %d", oldEspState, ATCommand, Mode, ATExpectation);
-			Debug("EspState: %s ATcmd: %s Mode: %s ATExp: %s",
-				ESPStateToString(oldEspState),
-				ATCommandToString(ATCommand),
-				ATModeToString(Mode),
-				ATExpectationToString(ATExpectation));
-		}
-	}
-	switch (ESPHandle->state)
-	{
-
-	case ESP_STATE_IDLE:
-		if (ESPHandle->configAP) {
-			ESPHandle->timeOutStamp = HAL_GetTick() + 15000;
-			ESPHandle->state = ESP_STATE_CONFIG;
-			Debug("ESP_STATE_IDLE -> ESP_STATE_CONFIG");
-		} else if(!ESPHandle->done){
-			ESPHandle->timeOutStamp = HAL_GetTick() + 15000;
-			ESPHandle->state = ESP_STATE_INIT;
-			EspTurnedOn = false;
-			Debug("ESP_STATE_IDLE -> ESP_STATE_INIT");
-		}
-		// Waiting for wake up call.
-		break;
-
-	case ESP_STATE_INIT:
-		if (!EspTurnedOn)
-		{
-			resetESP();
-			ESPTimeStamp = HAL_GetTick() + ESP_START_UP_TIME;
-			EspTurnedOn = true;
-			ESPHandle->ready = true;
-		}
-		// Wait for ESP to be ready
-		// Start reading DMA buffer for AT commands
-		if (ESP_Receive(RxBuffer, ESP_MAX_BUFFER_SIZE))
-		{
-			ESPHandle->state = ESP_STATE_WAIT_AWAKE;
-			Debug("ESP_STATE_INIT -> ESP_STATE_WAIT_AWAKE");
-		}
-		break;
-
-	case ESP_STATE_WAIT_AWAKE:
-		Debug("Waiting to process answer");
-		ATReceived = DMA_ProcessBuffer(RECEIVE_EXPECTATION_READY);
-		bool proceed = ATCompare(ATReceived, RECEIVE_EXPECTATION_READY);
-		if (proceed || TimestampIsReached(timeoutTimer))
-		{
-			ESPHandle->state = ESP_STATE_MODE_SELECT;
-			Debug("ESP_STATE_WAIT_AWAKE -> ESP_STATE_MODE_SELECT");
-		}
-		break;
-
-	case ESP_STATE_MODE_SELECT:   //use ESPHand.mode
-		memset(ATCommandArray, AT_END, 9); //sizeof(ATCommandArray)); //9
-		if (ESPHandle->mode == ESP_PROGRAM_INIT)
-		{
-			memcpy(ATCommandArray, AT_INIT, sizeof(AT_INIT));
-			Debug("ATCommand set to AT_INIT");
-			ESPHandle->state = ESP_STATE_SEND;
-			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
-			ATCounter = 0;
-			Mode = AT_MODE_INIT;
-			ATCommand = ATCommandArray[ATCounter];
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ESPHandle->mode == ESP_PROGRAM_SET_CONN)  // Still necesary?
-		{
-			memcpy(ATCommandArray, AT_WIFI_CONFIG, sizeof(AT_WIFI_CONFIG));
-			Debug("ATCommand set to AT_WIFI_CONFIG");
-			ESPHandle->state = ESP_STATE_SEND;
-			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
-			ATCounter = 0;
-			Mode = AT_MODE_CONFIG;
-			ATCommand = ATCommandArray[ATCounter];
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ESPHandle->mode == ESP_PROGRAM_TEST)
-		{
-			memcpy(ATCommandArray, AT_LOGIN, sizeof(AT_LOGIN));
-			Debug("ATCommand set to AT_LOGIN");
-			ESPHandle->state = ESP_STATE_SEND;
-			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
-			ATCounter = 0;
-			Mode = AT_MODE_TEST;
-			ATCommand = ATCommandArray[ATCounter];
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ESPHandle->mode == ESP_PROGRAM_SEND)
-		{
-			if (SentHTTPPost)
-			{
-				memcpy(ATCommandArray, AT_SEND_HTTP, sizeof(AT_SEND_HTTP));
-				Debug("ATCommand set to AT_SEND_HTTP");
-			}
-			else
-			{
-				memcpy(ATCommandArray, AT_SEND_MQTT, sizeof(AT_SEND_MQTT));
-				Debug("ATCommand set to AT_SEND_MQTT");
-			}
-			
-			ESPHandle->state = ESP_STATE_SEND;
-			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
-			ATCounter = 0;
-			Mode = AT_MODE_SEND;
-			start = HAL_GetTick();
-			// SetESPIndicator();
-			ATCommand = ATCommandArray[ATCounter];
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ESPHandle->mode == ESP_PROGRAM_CONFIG_AP)
-		{
-			memcpy(ATCommandArray, AT_WIFI_RECONFIG, sizeof(AT_WIFI_RECONFIG));
-			Debug("ATCommand set to AT_WIFI_RECONFIG");
-			Debug("Reconfig mode voor local wifi config selected");
-			//DisableConnectedDevices();
-			ESPHandle->state = ESP_STATE_SEND;
-			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
-			ATCounter = 0;
-			Mode = AT_MODE_RECONFIG;
-			// SetESPIndicator();
-			ATCommand = ATCommandArray[ATCounter];
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ESPHandle->mode == ESP_PROGRAM_RTC)			//TIME REQ
-		{
-			memcpy(ATCommandArray, AT_SNTP, sizeof(AT_SNTP));
-			Debug("ATCommand set to AT_SNTP");
-			ESPHandle->state = ESP_STATE_SEND;
-			Debug("ESP_STATE_MODE_SELECT -> ESP_STATE_SEND");
-			ATCounter = 0;
-			Mode = AT_MODE_GETTIME;
-			start = HAL_GetTick();
-			// SetESPIndicator();
-			ATCommand = ATCommandArray[ATCounter];
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		break;
-
-	case ESP_STATE_SEND: 
-		if(AT_Send(ATCommand)) {
-			ESPHandle->state = ESP_STATE_WAIT_FOR_REPLY;
-			Debug("ESP_STATE_SEND -> ESP_STATE_WAIT_FOR_REPLY");
-		}
-		break;
-
-	case ESP_STATE_WAIT_FOR_REPLY:
-		if (TimestampIsReached(ESPTimeStamp))
-		{
-			ATReceived = DMA_ProcessBuffer(ATExpectation);
-			bool proceed = ATCompare(ATReceived, ATExpectation);
-			if (ATReceived == RECEIVE_STATUS_ERROR)
-			{
-				if(ATCommand == AT_CWJAP){
-					ErrorBlinkWiFi();
-				}
-				if (ATCommand == AT_SENDDATA)
-				{
-					if (SentHTTPPost)
-					{
-						ATCommand = AT_HTTPCPOST;
-						ATExpectation = RECEIVE_EXPECTATION_START;
-					}
-					else
-					{
-						ATCommand = AT_MQTTUSERCFG;
-						ATExpectation = RECEIVE_EXPECTATION_OK;
-					}
-					ATCounter = 1;
-				}
-				ESPHandle->state = ESP_STATE_SEND;
-				Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
-				errorcntr++;
-				if (errorcntr >= ESP_MAX_RETRANSMITIONS)
-				{
-					ESPTimeStamp = HAL_GetTick() + ESP_UNTIL_NEXT_SEND;
-					// ResetESPIndicator();
-					clearDMABuffer();
-					stop = HAL_GetTick();
-					Error("ESP to many retransmits, terminated after %lu ms", (stop - start));
-					ESPHandle->state = ESP_STATE_DEINIT;
-					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_DEINIT");
-				}
-			}
-			if (ATReceived == RECEIVE_STATUS_INCOMPLETE)
-			{
-				ESPTimeStamp = HAL_GetTick() + 10;
-			}
-			if (ATReceived == RECEIVE_STATUS_TIMEOUT)
-			{
-				timeoutcntr++;
-				Error("In ESP_STATE_WAIT_FOR_REPLY: RECEIVE_STATUS_TIMEOUT reached");
-				if (timeoutcntr >= ESP_MAX_RETRANSMITIONS)
-				{
-					ESPTimeStamp = HAL_GetTick() + ESP_UNTIL_NEXT_SEND;
-					clearDMABuffer();
-					stop = HAL_GetTick();
-					Error("ESP to many timeouts, terminated after %lu ms", (stop - start));
-					ESPHandle->state = ESP_STATE_DEINIT;
-					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_DEINIT");
-				}
-				if (ATCommand != AT_SENDDATA)
-				{
-					ESPHandle->state = ESP_STATE_SEND;
-					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
-				}
-				else
-				{
-					if (SentHTTPPost) {
-						ATCommand = AT_HTTPCPOST;
-						ATExpectation = RECEIVE_EXPECTATION_START;
-					} else {
-						ATCommand = AT_MQTTUSERCFG;
-						ATExpectation = RECEIVE_EXPECTATION_OK;
-					}
-					ATCounter -= 1;
-					ESPHandle->state = ESP_STATE_SEND;
-					Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_SEND");
-				}
-			}
-			if (proceed)
-			{	
-				ESPHandle->state = ESP_STATE_NEXT_AT;
-				Debug("ESP_STATE_WAIT_FOR_REPLY -> ESP_STATE_NEXT_AT");
-			}
-		}
- 		break;
-
-	case ESP_STATE_NEXT_AT:
-		ATCounter += 1;
-		ATCommand = ATCommandArray[ATCounter];
-		if (ATCommand == AT_RESTORE)
-		{
-			ATExpectation = RECEIVE_EXPECTATION_READY;
-		}
-		if (ATCommand == AT_HTTPCPOST || ATCommand == AT_MQTTPUB)
-		{
-			ATExpectation = RECEIVE_EXPECTATION_START;
-		}
-		if (ATCommand != AT_HTTPCPOST && ATCommand != AT_RESTORE && ATCommand != AT_MQTTPUB)
-		{
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ATCommand == AT_MQTTUSERCFG || ATCommand == AT_MQTTCONN || ATCommand == AT_MQTTCLEAN)
-		{
-			ATExpectation = RECEIVE_EXPECTATION_OK;
-		}
-		if (ATCommand == AT_CIPSNTPCFG)
-		{
-			ATExpectation = RECEIVE_EXPECTATION_TIME;
-		}
-		ESPHandle->state = ESP_STATE_SEND;
-		Debug("ESP_STATE_NEXT_AT -> ESP_STATE_SEND");
-		if (ATCommand == AT_END)
-		{
-			if(ESPHandle->mode == ESP_PROGRAM_INIT || ESPHandle->mode == ESP_PROGRAM_SET_CONN){
-				if(!ESPHandle->connectionMade){
-					ErrorBlinkWiFi();
-					if(ESPHandle->mode == ESP_PROGRAM_SET_CONN){
-						ESPHandle->done = true;
-					}
-					ESPHandle->mode = ESP_PROGRAM_SET_CONN;
-				}
-				else{
-					// ESPHandle->mode = ESP_PROGRAM_RTC;
-					ESPHandle->mode = ESP_PROGRAM_SEND;
-				}
-				ESPHandle->state = ESP_STATE_IDLE;
-				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
-			}
-			else if (ESPHandle->mode == ESP_PROGRAM_SEND)
-			{
-				ESPTimeStamp = HAL_GetTick();// + ESP_UNTIL_NEXT_SEND;
-				// ResetESPIndicator();
-				clearDMABuffer();
-				stop = HAL_GetTick();
-				Info("Message send in %lu ms", (stop - start));
-				ResetdBAmax();
-				showTime();
-				ESPHandle->done = true;
-				// if(lastUpdateMonth != RTC_GetMonth())
-				// 	ESPHandle->mode = ESP_PROGRAM_RTC;
-				ESPHandle->state = ESP_STATE_IDLE; //ESP_STATE_DEINIT;
-				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
-			}
-			else if (ESPHandle->mode == ESP_PROGRAM_RTC)  //TIME REQ
-			{
-				setTime = false;
-				ESPNTPTimeStamp = HAL_GetTick() + ESP_UNTIL_NEXT_NTP;
-				Info("Time synchronized by NTP, next NTP should be called at tick: %lu", ESPNTPTimeStamp);
-				// ESPTimeStamp = savedESPTimeStamp;
-				// ResetESPIndicator();
-				clearDMABuffer();
-				stop = HAL_GetTick();
-				Info("Message time update in %lu ms", (stop - start));
-				ESPHandle->mode = ESP_PROGRAM_SEND;
-				ESPHandle->state = ESP_STATE_IDLE;
-				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
-			}
-			else
-			{
-				ESPHandle->state = ESP_STATE_IDLE;
-				Debug("ESP_STATE_NEXT_AT -> ESP_STATE_IDLE");
-			}
-		}
-		break;
+    // ── CONFIG: AP config mode — process USB commands until reset ─────────────
     case ESP_STATE_CONFIG:
-      Debug("Do nothing until reset");
-      Process_PC_Config(GetUsbRxPointer());
+        Process_PC_Config(GetUsbRxPointer());
+        break;
 
-      break;
-	default:
-		// Handle unexpected state
-		Error("Something unknown went wrong with the ESP_STATE: %s", ESPStateToString(ESPHandle->state));
-		ESPHandle->state = ESP_STATE_INIT;
-		Debug("unexpected state -> ESP_STATE_INIT");
-		break;
-	}
-	return ESPHandle->state;
+    default:
+        Error("Unexpected ESP state %d", ESPHandle->state);
+        ESPHandle->state = ESP_STATE_INIT;
+        break;
+    }
+
+    return ESPHandle->state;
 }
 
+// ── Debug helpers ─────────────────────────────────────────────────────────────
 
-const char* ESPStateToString(uint8_t state) {
-    switch(state) {
-        case ESP_STATE_IDLE: return "IDLE";
-        case ESP_STATE_INIT: return "INIT";
-        case ESP_STATE_WAIT_AWAKE: return "WAIT_AWAKE";
-        case ESP_STATE_MODE_SELECT: return "MODE_SELECT";
-        case ESP_STATE_SEND: return "SEND";
-        case ESP_STATE_WAIT_FOR_REPLY: return "WAIT_FOR_REPLY";
-        case ESP_STATE_NEXT_AT: return "NEXT_AT";
-        case ESP_STATE_CONFIG: return "CONFIG";
-        case ESP_STATE_DEINIT: return "DEINIT";
-        default: return "UNKNOWN_STATE";
+const char *ESPStateToString(uint8_t state) {
+    switch (state) {
+    case ESP_STATE_IDLE:           return "IDLE";
+    case ESP_STATE_INIT:           return "INIT";
+    case ESP_STATE_WAIT_AWAKE:     return "WAIT_AWAKE";
+    case ESP_STATE_MODE_SELECT:    return "MODE_SELECT";
+    case ESP_STATE_SEND:           return "SEND";
+    case ESP_STATE_WAIT_FOR_REPLY: return "WAIT_FOR_REPLY";
+    case ESP_STATE_NEXT_AT:        return "NEXT_AT";
+    case ESP_STATE_CONFIG:         return "CONFIG";
+    case ESP_STATE_DEINIT:         return "DEINIT";
+    default:                       return "UNKNOWN";
     }
 }
 
-const char* ATCommandToString(AT_Commands cmd) {
-    switch(cmd) {
-        case AT_WAKEUP: return "WAKEUP";
-        case AT_SET_RFPOWER: return "SET_RFPOWER";
-        case AT_CHECK_RFPOWER: return "CHECK_RFPOWER";
-        case AT_RESTORE: return "RESTORE";
-        case AT_CWINIT: return "CWINIT";
-        case AT_CWSTATE: return "CWSTATE";
-        case AT_CWMODE1: return "CWMODE1";
-        case AT_CWMODE2: return "CWMODE2";
-        case AT_CWMODE3: return "CWMODE3";
-        case AT_CWAUTOCONN: return "CWAUTOCONN";
-        case AT_CWJAP: return "CWJAP";
-        case AT_CWSAP: return "CWSAP";
-        case AT_CIPMUX: return "CIPMUX";
-        case AT_WEBSERVER: return "WEBSERVER";
-        case AT_HTTPCPOST: return "HTTPCPOST";
-        case AT_SENDDATA: return "SENDDATA";
-        case AT_MQTTUSERCFG: return "MQTTUSERCFG";
-        case AT_MQTTCONN: return "MQTTCONN";
-        case AT_MQTTPUB: return "MQTTPUB";
-        case AT_MQTTCLEAN: return "MQTTCLEAN";
-        case AT_CIPSNTPCFG: return "CIPSNTPCFG";
-        case AT_CIPSNTPTIME: return "CIPSNTPTIME";
-        case AT_CIPSNTPINTV: return "CIPSNTPINTV";
-        case AT_END: return "END";
-        default: return "UNKNOWN_CMD";
+const char *ATCommandToString(AT_Commands cmd) {
+    switch (cmd) {
+    case AT_WAKEUP:      return "WAKEUP";
+    case AT_SET_RFPOWER: return "SET_RFPOWER";
+    case AT_RESTORE:     return "RESTORE";
+    case AT_CWINIT:      return "CWINIT";
+    case AT_CWSTATE:     return "CWSTATE";
+    case AT_CWMODE1:     return "CWMODE1";
+    case AT_CWMODE2:     return "CWMODE2";
+    case AT_CWMODE3:     return "CWMODE3";
+    case AT_CWAUTOCONN:  return "CWAUTOCONN";
+    case AT_CWJAP:       return "CWJAP";
+    case AT_CWSAP:       return "CWSAP";
+    case AT_CIPMUX:      return "CIPMUX";
+    case AT_WEBSERVER:   return "WEBSERVER";
+    case AT_SENDDATA:    return "SENDDATA";
+    case AT_MQTTUSERCFG: return "MQTTUSERCFG";
+    case AT_MQTTCONN:    return "MQTTCONN";
+    case AT_MQTTPUB:     return "MQTTPUB";
+    case AT_MQTTCLEAN:   return "MQTTCLEAN";
+    case AT_CIPSNTPCFG:  return "CIPSNTPCFG";
+    case AT_CIPSNTPTIME: return "CIPSNTPTIME";
+    case AT_CIPSNTPINTV: return "CIPSNTPINTV";
+    case AT_END:         return "END";
+    default:             return "UNKNOWN";
     }
 }
 
-const char* ATModeToString(AT_Mode mode) {
-    switch(mode) {
-        case AT_MODE_INIT: return "INIT";
-        case AT_MODE_CONFIG: return "CONFIG";
-        case AT_MODE_TEST: return "TEST";
-        case AT_MODE_SEND: return "SEND";
-        case AT_MODE_RECONFIG: return "RECONFIG";
-        case AT_MODE_GETTIME: return "GETTIME";
-        default: return "UNKNOWN_MODE";
+const char *ATModeToString(AT_Mode mode) {
+    switch (mode) {
+    case AT_MODE_INIT:     return "INIT";
+    case AT_MODE_CONFIG:   return "CONFIG";
+    case AT_MODE_SEND:     return "SEND";
+    case AT_MODE_RECONFIG: return "RECONFIG";
+    case AT_MODE_GETTIME:  return "GETTIME";
+    default:               return "UNKNOWN";
     }
 }
 
-const char* ATExpectationToString(AT_Expectation exp) {
-    switch(exp) {
-        case RECEIVE_EXPECTATION_OK: return "OK";
-        case RECEIVE_EXPECTATION_READY: return "READY";
-        case RECEIVE_EXPECTATION_START: return "START";
-        case RECEIVE_EXPECTATION_TIME: return "TIME";
-        default: return "UNKNOWN_EXP";
+const char *ATExpectationToString(AT_Expectation exp) {
+    switch (exp) {
+    case RECEIVE_EXPECTATION_OK:    return "OK";
+    case RECEIVE_EXPECTATION_READY: return "READY";
+    case RECEIVE_EXPECTATION_START: return "START";
+    case RECEIVE_EXPECTATION_TIME:  return "TIME";
+    default:                        return "UNKNOWN";
     }
 }

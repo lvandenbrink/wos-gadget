@@ -1,20 +1,17 @@
-Find more information at:
-https://wiki.deomgevingsmonitor.nl/index.php/Main_Page
+# WOS-Gadget
 
-version 3.71 fix for reset timeoutcntr
+Forked from: http://github.com/kittengineering/Omgevingsmonitor_Software
 
-Version 3.7 When USB powered and a sen54 or sen55 is connected the on-board SGP40 is disabled. VOC is handled by the sen54/55 module. Due to the VOC algorithm of the sen5x the value is reset after every powercycle. Therefore the SGP40 is enabled when operated on batterypower. When a sen54 or sen55 is attached, a mode is added that the PM measurement is disabled, but the VOC index, temperature and NOx is measured. This mode is selected by press and hold the userbuttton for 2 seconds. This mode uses less power than continious PM measurement, but it is not an energy saving mode. The battery is empty in less than a day. When the capacity is below approx. 40% the sen5x is switched off.  The VOC LED flashes green when selected and red when PM enabled again. When operating on battery the sensors are switched off before sending the datagram by WiFi. Status turns white when PM measurement is executed.
 
-Version 3.5 source code parts moved from main.x to measurement.x. Auto reboot on incorrect start-up, shown by 3 red LEDs short after booting. After firmware update please reset 2 times with 10 second pause for the 2nd reset. Otherwise the current consumption in stopmode is about 12mA instead of 2.3mA. Who can explain this difference or find a solution?
+| Constrols | | | |
+|---------|:--------:|-----:|-----:|
+| LED     |   Status | dB   | VOC  |
+| Buttons |    RESET | BOOT | USER |
 
-Version 3.4 NOx and VOC from sen55 is included in measurement. For this it is necessary that the sen55 has a longer runtime, this needs a USB powersupply. NOx is after 6 hours of operation reliable, VOC after about an hour. With battery operation the values for NOx and VOC reads zero from the sen55.
 
-This release makes it possible to operate the Omgevings Monitor (OM) independently of USB power for a longer period >> days. Needless to write, this depends on the ambient temperature and the amount of daylight that the solar panel receives. In battery operation the status LED will flash briefly 3 to 4 times while measurements are being carried out. Green means the battery has sufficient charge. If the LED flashes red during measaurement the remaining charge level is approximately 20%, the battery needs to be charged. The measurements are carried out once every 15 minutes in battery operation.
+Press BOOT + USER button during start up -> Process PC Config
 
-It is possible to use the OM as a handheld by using the BOOT0 button in case of battery operation. The OM then wakes up from energy saving mode. This becomes visible by the lighting of the LEDs. By pressing the user button, the LEDs go out again and the OM starts operating in energy saving mode again. 
-
-If the battery is low, the system will enter a very low energy state and will not operate normal until the battery is charged. By pressing the reset button while charging, the device becomes operational again. 
-As long as there is some energy in the battery, it is possible that the device will start up briefly and then go back into battery protection mode.
+Press USER button during start up -> Start Wifi config AP
 
 The dB LED has the following meaning, more or less in the order of the rainbow:
 dBA >= 90 white
@@ -26,3 +23,165 @@ dBA >= 40 && dBA < 50 blue
 dBA >= 35 && dBA < 40 purple
 dBA < 35 LED off, equals to noise level of the microphone
 
+## Getting started
+
+Reference: https://wiki.deomgevingsmonitor.nl/index.php/Programmeeromgeving
+
+Install [STM32CubeProgrammer](https://www.st.com/en/development-tools/stm32cubeprog.html#get-softwarehttps://www.st.com/en/development-tools/stm32cubeprog.html#get-software)
+
+Follow the wizard
+```
+./stm32cubeprg-lin-v2-20-0/SetupSTM32CubeProgrammer-2.20.0.linux 
+```
+
+## State diagram
+
+### Main State
+![Main State](Main_Thread_State_Diagram.png)
+
+### ESP upkeep State
+![ESP upkeep State](ESP_STATE_Diagram.png)
+
+### Measurement State
+![Measurement State](Measurement_State_Diagram.png)
+
+### Diagrams
+Requirements to view PlantUML diagrams:
+- Java
+- graphviz
+```
+sudo apt install graphviz
+```
+- VSCode extention: [PlantUML](https://marketplace.visualstudio.com/items?itemName=jebbs.plantuml)
+
+
+## Compiling
+Compile the program with either STM32CubeIDE or command line.
+
+### 1. STM32CubeIDE
+
+    1. Open STM32CubeIDE
+    2. Import the project:
+        - File → Import → General → Existing Projects into Workspace
+        - Browse to wos-gadget
+        - Select the project and click Finish
+    3. Build the project:
+        - Right-click on project → Build Project
+        - Or use Ctrl+B
+        - Or click the hammer icon in the toolbar
+    
+    4. Manage Embedded Software Packages
+        - Install `STM32CubeL0` version `V1.12.2` which install package in `STM32Cube/Repository/STM32Cube_FW_L0_V1.12.2`
+
+### 2. Commnand line
+```
+# from project root 
+cmake --preset debug
+cmake --build --preset debug
+```
+## Deploying
+
+Start the STM32CubeProgrammer select `build/MSJGadget*.elf` 
+Press middle (Reset) and right (Boot) button. Let go of the right button first. 
+Upload the firmware with 'Download'.  
+Press 2x reset 
+
+## Connecting
+
+```
+gtkterm -p /dev/ttyACM0 -s 115200
+```
+
+# Troubleshoot
+
+## compiling in Linux
+`fatal error: String.h: No such file or directory`
+
+Change '#include <String.h>' to '#include <string.h>
+Change '#include "EEprom.h"' to '#include <EEProm.h>
+Change '#include "GPIO.h"' to '#include "gpio.h"'
+
+### Home Assistant config
+Configure Home Assistant to listen to the WOS gadget.
+```yaml
+# ── Sensors ───────────────────────────────────────────────────
+  sensor:
+    # WOS Gadget
+    - name: "WOS Temperature"
+      unique_id: wos_temperature
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.temperature }}"
+      unit_of_measurement: "°C"
+      device_class: temperature
+      state_class: measurement
+      device: &wos_device
+        identifiers: ["wos_omgevingsmonitor"]
+        name: "WOS Omgevingsmonitor"
+        model: "WOS Gadget"
+        manufacturer: "Custom"
+    - name: "WOS Humidity"
+      unique_id: wos_humidity
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.humidity }}"
+      unit_of_measurement: "%"
+      device_class: humidity
+      state_class: measurement
+      device: *wos_device
+    - name: "WOS Sound Level"
+      unique_id: wos_sound
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.sound }}"
+      unit_of_measurement: "dB(A)"
+      state_class: measurement
+      icon: mdi:volume-high
+      device: *wos_device
+    - name: "WOS Battery Voltage"
+      unique_id: wos_battery
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.battery }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      device: *wos_device
+    - name: "WOS Solar Voltage"
+      unique_id: wos_solar
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.solar }}"
+      unit_of_measurement: "V"
+      device_class: voltage
+      state_class: measurement
+      icon: mdi:solar-power
+      device: *wos_device
+    - name: "WOS VOC Index"
+      unique_id: wos_voc
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.voc }}"
+      unit_of_measurement: "VOCi"
+      state_class: measurement
+      icon: mdi:air-filter
+      device: *wos_device
+    - name: "WOS PM2.5"
+      unique_id: wos_pm25
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json['PM2.5'] | default(none) }}"
+      unit_of_measurement: "µg/m³"
+      device_class: pm25
+      state_class: measurement
+      device: *wos_device
+    - name: "WOS PM10"
+      unique_id: wos_pm10
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json['PM10'] | default(none) }}"
+      unit_of_measurement: "µg/m³"
+      device_class: pm10
+      state_class: measurement
+      device: *wos_device
+    - name: "WOS NOx Index"
+      unique_id: wos_nox
+      state_topic: "sensor/climate/wos"
+      value_template: "{{ value_json.NOx | default(none) }}"
+      unit_of_measurement: "ppb"
+      state_class: measurement
+      icon: mdi:molecule
+      device: *wos_device
+```

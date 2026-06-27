@@ -73,7 +73,10 @@ bool measurementUpkeep(){
       measurementHandler.state = MEASURE_STATE_BUSY;
     break;
 
-    case MEASURE_STATE_BUSY:
+    case MEASURE_STATE_BUSY: {
+      static uint32_t busyStart = 0;
+      if (busyStart == 0) busyStart = HAL_GetTick();
+
       HIDS_Upkeep();
       petDog();
       Mic_Upkeep();
@@ -81,15 +84,26 @@ bool measurementUpkeep(){
       SGP_Upkeep();
       petDog();
 
-      if(measurementHandler.Sens.active)
+      if (measurementHandler.Sens.active)
         sen5x_statemachine();
 
       checkDone();
-      if(measurementHandler.measurementsDone){
+
+      // 45-second hard timeout: mark incomplete sensors done so publishing
+      // still happens even if one sensor hangs or stalls.
+      bool timedOut = (HAL_GetTick() - busyStart) > 45000;
+      if (timedOut && !measurementHandler.measurementsDone) {
+        Info("Measurement timeout — using partial results");
+        measurementHandler.measurementsDone = true;
+      }
+
+      if (measurementHandler.measurementsDone) {
+        busyStart = 0;
         measurementHandler.state = MEASURE_STATE_IDLE;
         HAL_GPIO_WritePin(MCU_LED_C_G_GPIO_Port, MCU_LED_C_G_Pin, true);
         HAL_GPIO_WritePin(MCU_LED_C_B_GPIO_Port, MCU_LED_C_B_Pin, false);
       }
+    }
     break;
 
     case MEASURE_STATE_IDLE:

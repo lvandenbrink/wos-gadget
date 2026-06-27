@@ -4,14 +4,16 @@
 #include "main.h"
 #include "microphone.h"
 #include "ESP.h"
-// #include "sgp40.h"
-// #include "wsenHIDS.h"
 #include "statusCheck.h"
+#include "usb_device.h"
+#include "PowerUtils.h"
 #include <string.h>
 #include <stdlib.h>
 
 #include "sgp40.h"
 #include "wsenHIDS.h"
+
+extern USBD_HandleTypeDef hUsbDeviceFS;
 
 #define SAFE_SLEEP_TIME 20
 
@@ -400,30 +402,38 @@ void watchdogStopMode(uint16_t sleepTime){
 
 void Enter_Stop_Mode(uint16_t sleepTime)
 {
-	if (sen5x_On && !UsbPowered())
-	{
-		sen5x_Power_Off();
-	}
-	Info("Battery voltage %.02fV", ReadBatteryVoltage());
-	Debug("Entering STOP mode for %d seconds", sleepTime);
-	getUTCfromPosixTime(getPosixTime() + sleepTime, strbuf);
-	Info("The system will wake up at %s.", strbuf);
-	HAL_Delay(100);
-	HAL_SuspendTick();
-	RTC_SetWakeUpTimer(sleepTime);
-	//  HAL_PWREx_EnableFlashPowerDown();  // is default stopped in l0xx cpu's
-	//  SET_BIT(PWR->CR, PWR_CR_ULP); seems of no influence
-	HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
-	SystemClock_Config();
-	HAL_ResumeTick(); // Enable SysTick after wake-up
-	showTime();
-	ResetDBACalculator(); // reset the DBA average calculation
-	// ResetSGP40samplecounter();
-	setsen5xSamplecounter(0);
-	//  setESPTimeStamp(3000);
-	// setSGP40TimeStamp(0);
-	setHIDSTimeStamp(0);
-	setMICTimeStamp(0);
+    if (sen5x_On && !UsbPowered())
+        sen5x_Power_Off();
+
+    Info("Battery %.02fV — sleeping %u s", ReadBatteryVoltage(), sleepTime);
+    getUTCfromPosixTime(getPosixTime() + sleepTime, strbuf);
+    Info("Wake at %s", strbuf);
+
+    HAL_Delay(100);  // let any pending UART bytes flush
+
+    // Deinit USB before STOP to prevent the USB PHY (and HSI48) from waking
+    // the device on every SOF packet (1 ms), which inflates stop-mode current
+    // from ~2.3 mA to ~12 mA (documented in README).
+    USBD_DeInit(&hUsbDeviceFS);
+
+    HAL_SuspendTick();
+    RTC_SetWakeUpTimer(sleepTime);
+    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON, PWR_STOPENTRY_WFI);
+
+    // Restore clocks (SystemClock_Config re-enables HSI48)
+    SystemClock_Config();
+    HAL_ResumeTick();
+
+    // Re-init USB only when a host is actually connected; on battery there is
+    // no host, so skipping init removes an unnecessary ~0.5 mA draw.
+    if (Check_USB_PowerOn())
+        MX_USB_DEVICE_Init();
+
+    showTime();
+    ResetDBACalculator();
+    setsen5xSamplecounter(0);
+    setHIDSTimeStamp(0);
+    setMICTimeStamp(0);
 }
 
 void InitClock(RTC_HandleTypeDef *h_hrtc)
